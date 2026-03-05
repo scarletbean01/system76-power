@@ -15,8 +15,11 @@ pub fn set(profile: Profile, max_percent: u8) {
     let min_freq = core.frequency_minimum();
     let max_freq = core.frequency_maximum();
 
+    log::info!("Setting CPU frequency for profile: {:?}", profile);
+    log::info!("  CPU frequency range: min={:?} kHz, max={:?} kHz", min_freq, max_freq);
+
     if let Some(driver) = core.scaling_driver() {
-        let is_amd_pstate = driver.starts_with("amd-pstate");
+        log::info!("  Detected CPU scaling driver: {}", driver);
 
         // The profile for the `energy_performance_preference`.
         let mut epp = None;
@@ -49,17 +52,31 @@ pub fn set(profile: Profile, max_percent: u8) {
             }
         };
 
+        log::info!("  Selected governor: {}", governor);
+        if let Some(pref) = epp {
+            log::info!("  EPP preference: {}", pref);
+        }
+
         if let Some((cpus, (min, max))) = num_cpus().zip(min_freq.zip(max_freq)) {
             let max = max * max_percent.min(100) as usize / 100;
-            eprintln!("setting {} with max {}", governor, max);
+            log::info!(
+                "  Applying frequency limits: min={} kHz, max={} kHz ({}% of {} kHz)",
+                min,
+                max,
+                max_percent,
+                max_freq.unwrap_or(0)
+            );
+            log::info!("  Total CPUs to configure: {}", cpus + 1);
 
             for cpu in 0..=cpus {
                 core.load(cpu);
 
-                if !is_amd_pstate {
-                    core.set_frequency_minimum(min);
-                    core.set_frequency_maximum(max);
-                }
+                // Set frequency limits for all drivers, including amd-pstate variants.
+                // Even though amd-pstate-epp primarily uses EPP (Energy Performance Preference)
+                // hints, the scaling_max_freq parameter must still be set to enforce the
+                // maximum frequency cap. Without this, the CPU can get stuck at low frequencies.
+                core.set_frequency_minimum(min);
+                core.set_frequency_maximum(max);
 
                 core.set_governor(governor);
 
@@ -67,15 +84,65 @@ pub fn set(profile: Profile, max_percent: u8) {
                     core.set_epp(preference);
                 }
             }
+
+            log::info!("  CPU frequency configuration completed for {} cores", cpus + 1);
+        } else {
+            log::warn!("  Failed to get CPU count or frequency range - skipping CPU configuration");
         }
+
+        // Set CPU boost for AMD/generic cpufreq (complements Intel PState no_turbo)
+        set_boost(profile);
+    } else {
+        log::error!("  Failed to detect CPU scaling driver - cannot configure CPU frequency");
+    }
+}
+
+/// Controls CPU boost/turbo for AMD and generic cpufreq drivers.
+/// This complements Intel PState's no_turbo parameter handled in daemon/profiles.rs
+/// and provides boost control for AMD Ryzen CPUs via the generic cpufreq boost interface.
+fn set_boost(profile: Profile) {
+    let boost_value = match profile {
+        Profile::Battery => b"0", // Disable boost on battery to save power
+        Profile::Balanced | Profile::Performance => b"1", // Enable boost
+    };
+
+    // Try global boost path first (standard location)
+    let global_boost_path = "/sys/devices/system/cpu/cpufreq/boost";
+    if std::path::Path::new(global_boost_path).exists() {
+        match fs::write(global_boost_path, boost_value) {
+            Ok(()) => {
+                log::info!(
+                    "CPU boost set to {} for {:?} profile",
+                    std::str::from_utf8(boost_value).unwrap_or("?"),
+                    profile
+                );
+                return;
+            }
+            Err(e) => log::warn!("Failed to set CPU boost at {}: {}", global_boost_path, e),
+        }
+    }
+
+    // Fallback: try per-CPU boost path (some systems use this)
+    let per_cpu_boost_path = "/sys/devices/system/cpu/cpu0/cpufreq/boost";
+    if std::path::Path::new(per_cpu_boost_path).exists() {
+        match fs::write(per_cpu_boost_path, boost_value) {
+            Ok(()) => log::info!(
+                "CPU boost set to {} for {:?} profile (via per-CPU path)",
+                std::str::from_utf8(boost_value).unwrap_or("?"),
+                profile
+            ),
+            Err(e) => log::warn!("Failed to set CPU boost at {}: {}", per_cpu_boost_path, e),
+        }
+    } else {
+        log::debug!("CPU boost control not available (neither global nor per-CPU path found)");
     }
 }
 
 pub struct Cpu {
     /// Stores the path of the file being accessed.
-    path:        String,
+    path: String,
     /// Know where to truncate the path.
-    path_len:    usize,
+    path_len: usize,
     /// Scratch space for read files
     read_buffer: Vec<u8>,
 }
@@ -106,21 +173,37 @@ impl Cpu {
     }
 
     #[must_use]
-    pub fn scaling_driver(&mut self) -> Option<&str> { self.get_value("scaling_driver") }
+    pub fn scaling_driver(&mut self) -> Option<&str> {
+        self.get_value("scaling_driver")
+    }
 
     pub fn set_epp(&mut self, preference: &str) {
+        log::debug!("  Setting EPP to '{}' on {}", preference, &self.path[..self.path_len]);
         self.set_value("energy_performance_preference", preference);
     }
 
     pub fn set_frequency_maximum(&mut self, frequency: usize) {
+        log::debug!(
+            "  Setting max frequency to {} kHz on {}",
+            frequency,
+            &self.path[..self.path_len]
+        );
         self.set_value("scaling_max_freq", frequency);
     }
 
     pub fn set_frequency_minimum(&mut self, frequency: usize) {
+        log::debug!(
+            "  Setting min frequency to {} kHz on {}",
+            frequency,
+            &self.path[..self.path_len]
+        );
         self.set_value("scaling_min_freq", frequency);
     }
 
-    pub fn set_governor(&mut self, governor: &str) { self.set_value("scaling_governor", governor); }
+    pub fn set_governor(&mut self, governor: &str) {
+        log::debug!("  Setting governor to '{}' on {}", governor, &self.path[..self.path_len]);
+        self.set_value("scaling_governor", governor);
+    }
 
     fn set_value<V: std::fmt::Display>(&mut self, file: &str, value: V) {
         self.path.truncate(self.path_len);

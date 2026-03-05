@@ -25,7 +25,7 @@ use crate::{
     charge_thresholds::{get_charge_profiles, get_charge_thresholds, set_charge_thresholds},
     errors::ProfileError,
     fan::FanDaemon,
-    graphics::{Graphics, GraphicsMode},
+    graphics::{update_initramfs_cmd, Graphics, GraphicsMode},
     hid_backlight,
     hotplug::{mux, Detect, HotPlugDetect},
     kernel_parameters::{KernelParameter, NmiWatchdog},
@@ -68,28 +68,285 @@ static PCI_RUNTIME_PM: AtomicBool = AtomicBool::new(false);
 // TODO: Whitelist system76 hardware that's known to work with this setting.
 pub(crate) fn pci_runtime_pm_support() -> bool { PCI_RUNTIME_PM.load(Ordering::SeqCst) }
 
+/// Load auto-switching configuration from /etc/system76-power.conf
+///
+/// Returns true if auto-switching should be enabled (default: true)
+fn load_auto_switch_config() -> bool {
+    let config_path = "/etc/system76-power.conf";
+    
+    match fs::read_to_string(config_path) {
+        Ok(content) => {
+            // Simple parsing: look for "enabled = true" or "enabled = false"
+            let enabled = content.lines()
+                .find(|line| line.trim().starts_with("enabled"))
+                .and_then(|line| {
+                    line.split('=')
+                        .nth(1)
+                        .map(|v| v.trim() == "true")
+                })
+                .unwrap_or(true); // Default to enabled if not found
+            
+            log::info!("Auto-switching configuration loaded: {}", if enabled { "enabled" } else { "disabled" });
+            enabled
+        }
+        Err(_) => {
+            log::info!("No configuration file found at {}, using default: auto-switching enabled", config_path);
+            true // Default: enabled
+        }
+    }
+}
+
+/// Configuration for refresh rate auto-switching
+#[derive(Debug, Clone)]
+struct RefreshRateConfig {
+    enabled: bool,
+    battery: u32,
+    balanced: u32,
+    performance: u32,
+}
+
+impl Default for RefreshRateConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            battery: 60,
+            balanced: 60,
+            performance: 165,
+        }
+    }
+}
+
+/// Load refresh rate configuration from /etc/system76-power.conf
+///
+/// Returns RefreshRateConfig with settings from config file or defaults
+fn load_refresh_rate_config() -> RefreshRateConfig {
+    let config_path = "/etc/system76-power.conf";
+    
+    match fs::read_to_string(config_path) {
+        Ok(content) => {
+            let mut config = RefreshRateConfig::default();
+            let mut in_refresh_section = false;
+            
+            for line in content.lines() {
+                let trimmed = line.trim();
+                
+                // Check for [refresh_rate] section
+                if trimmed == "[refresh_rate]" {
+                    in_refresh_section = true;
+                    continue;
+                }
+                
+                // Exit section if we hit another section header
+                if trimmed.starts_with('[') && trimmed != "[refresh_rate]" {
+                    in_refresh_section = false;
+                    continue;
+                }
+                
+                // Parse settings only within [refresh_rate] section
+                if in_refresh_section && trimmed.contains('=') {
+                    let parts: Vec<&str> = trimmed.splitn(2, '=').collect();
+                    if parts.len() == 2 {
+                        let key = parts[0].trim();
+                        let value = parts[1].trim();
+                        
+                        match key {
+                            "enabled" => {
+                                config.enabled = value == "true";
+                            }
+                            "battery" => {
+                                if let Ok(hz) = value.parse::<u32>() {
+                                    config.battery = hz;
+                                }
+                            }
+                            "balanced" => {
+                                if let Ok(hz) = value.parse::<u32>() {
+                                    config.balanced = hz;
+                                }
+                            }
+                            "performance" => {
+                                if let Ok(hz) = value.parse::<u32>() {
+                                    config.performance = hz;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            
+            log::info!(
+                "Refresh rate configuration loaded: enabled={}, battery={}Hz, balanced={}Hz, performance={}Hz",
+                config.enabled, config.battery, config.balanced, config.performance
+            );
+            config
+        }
+        Err(_) => {
+            log::info!("No configuration file found at {}, using refresh rate defaults: 60/60/165 Hz", config_path);
+            RefreshRateConfig::default()
+        }
+    }
+}
+
+/// Load display mode configuration from /etc/system76-power.conf
+///
+/// Returns DisplayModeConfig with settings from config file or defaults
+fn load_display_mode_config() -> crate::display::DisplayModeConfig {
+    use crate::display::{DisplayModeConfig, ModeSpec};
+    
+    let config_path = "/etc/system76-power.conf";
+    
+    match fs::read_to_string(config_path) {
+        Ok(content) => {
+            let mut config = DisplayModeConfig::default();
+            let mut in_display_modes_section = false;
+            
+            // Temporary storage for mode components
+            let mut ac_resolution: Option<String> = None;
+            let mut ac_refresh_rate: Option<u32> = None;
+            let mut ac_mode_string: Option<String> = None;
+            let mut battery_resolution: Option<String> = None;
+            let mut battery_refresh_rate: Option<u32> = None;
+            let mut battery_mode_string: Option<String> = None;
+            
+            for line in content.lines() {
+                let trimmed = line.trim();
+                
+                // Check for [display_modes] section
+                if trimmed == "[display_modes]" {
+                    in_display_modes_section = true;
+                    continue;
+                }
+                
+                // Exit section if we hit another section header
+                if trimmed.starts_with('[') && trimmed != "[display_modes]" {
+                    in_display_modes_section = false;
+                    continue;
+                }
+                
+                // Parse settings only within [display_modes] section
+                if in_display_modes_section && trimmed.contains('=') {
+                    let parts: Vec<&str> = trimmed.splitn(2, '=').collect();
+                    if parts.len() == 2 {
+                        let key = parts[0].trim();
+                        let value = parts[1].trim().trim_matches('"');
+                        
+                        match key {
+                            "enabled" => {
+                                config.enabled = value == "true";
+                            }
+                            // AC mode settings
+                            "ac_mode" => {
+                                ac_mode_string = Some(value.to_string());
+                            }
+                            "ac_resolution" => {
+                                ac_resolution = Some(value.to_string());
+                            }
+                            "ac_refresh_rate" => {
+                                if let Ok(hz) = value.parse::<u32>() {
+                                    ac_refresh_rate = Some(hz);
+                                }
+                            }
+                            // Battery mode settings
+                            "battery_mode" => {
+                                battery_mode_string = Some(value.to_string());
+                            }
+                            "battery_resolution" => {
+                                battery_resolution = Some(value.to_string());
+                            }
+                            "battery_refresh_rate" => {
+                                if let Ok(hz) = value.parse::<u32>() {
+                                    battery_refresh_rate = Some(hz);
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            
+            // Build AC mode (prefer explicit mode string over resolution+rate)
+            if let Some(mode_str) = ac_mode_string {
+                config.ac_mode = Some(ModeSpec::ModeString(mode_str.clone()));
+                log::debug!("AC mode: explicit mode string '{}'", mode_str);
+            } else if let (Some(res), Some(hz)) = (ac_resolution, ac_refresh_rate) {
+                // Parse resolution (format: "2560x1440")
+                let res_parts: Vec<&str> = res.split('x').collect();
+                if res_parts.len() == 2 {
+                    if let (Ok(width), Ok(height)) = (res_parts[0].parse::<u32>(), res_parts[1].parse::<u32>()) {
+                        config.ac_mode = Some(ModeSpec::ResolutionAndRate(width, height, hz));
+                        log::debug!("AC mode: {}x{}@{}Hz", width, height, hz);
+                    }
+                }
+            }
+            
+            // Build battery mode (prefer explicit mode string over resolution+rate)
+            if let Some(mode_str) = battery_mode_string {
+                config.battery_mode = Some(ModeSpec::ModeString(mode_str.clone()));
+                log::debug!("Battery mode: explicit mode string '{}'", mode_str);
+            } else if let (Some(res), Some(hz)) = (battery_resolution, battery_refresh_rate) {
+                // Parse resolution (format: "1920x1080")
+                let res_parts: Vec<&str> = res.split('x').collect();
+                if res_parts.len() == 2 {
+                    if let (Ok(width), Ok(height)) = (res_parts[0].parse::<u32>(), res_parts[1].parse::<u32>()) {
+                        config.battery_mode = Some(ModeSpec::ResolutionAndRate(width, height, hz));
+                        log::debug!("Battery mode: {}x{}@{}Hz", width, height, hz);
+                    }
+                }
+            }
+            
+            log::info!(
+                "Display mode configuration loaded: enabled={}, ac_mode={:?}, battery_mode={:?}",
+                config.enabled,
+                config.ac_mode.is_some(),
+                config.battery_mode.is_some()
+            );
+            config
+        }
+        Err(_) => {
+            log::info!("No display_modes configuration found, using defaults (disabled)");
+            DisplayModeConfig::default()
+        }
+    }
+}
+
 struct PowerDaemon {
-    initial_set:    bool,
-    graphics:       Graphics,
-    power_profile:  String,
-    profile_errors: Vec<ProfileError>,
-    held_profiles:  Vec<(u32, &'static str, String, String)>,
-    profile_ids:    u32,
-    connections:    Option<(zbus::Connection, zbus::Connection, zbus::Connection)>,
+    initial_set:                 bool,
+    graphics:                    Graphics,
+    power_profile:               String,
+    profile_errors:              Vec<ProfileError>,
+    held_profiles:               Vec<(u32, &'static str, String, String)>,
+    profile_ids:                 u32,
+    connections:                 Option<(zbus::Connection, zbus::Connection, zbus::Connection)>,
+    auto_switch_enabled:         bool,
+    auto_switch_manual_override: bool,
+    refresh_rate_config:         RefreshRateConfig,
+    display_mode_config:         crate::display::DisplayModeConfig,
+    /// True once a high-refresh display mode/rate was applied on AC power.
+    /// Cleared only when the charger is unplugged (PowerSource::Battery event).
+    /// While set, profile switches will not override the display refresh rate.
+    ac_display_locked:           bool,
 }
 
 impl PowerDaemon {
     fn new() -> anyhow::Result<Self> {
         let graphics = Graphics::new()?;
+        let auto_switch_enabled = load_auto_switch_config();
+        let refresh_rate_config = load_refresh_rate_config();
+        let display_mode_config = load_display_mode_config();
 
         Ok(Self {
-            initial_set: false,
+            initial_set:                 false,
             graphics,
-            power_profile: String::new(),
-            profile_errors: Vec::new(),
-            held_profiles: Vec::new(),
-            profile_ids: 0,
-            connections: None,
+            power_profile:               String::new(),
+            profile_errors:              Vec::new(),
+            held_profiles:               Vec::new(),
+            profile_ids:                 0,
+            connections:                 None,
+            auto_switch_enabled,
+            auto_switch_manual_override: false,
+            refresh_rate_config,
+            display_mode_config,
+            ac_display_locked:           false,
         })
     }
 
@@ -109,6 +366,33 @@ impl PowerDaemon {
         func(&mut self.profile_errors, self.initial_set);
 
         self.power_profile = name.into();
+
+        // Apply refresh rate if enabled
+        if self.refresh_rate_config.enabled {
+            let hz = match name {
+                "Battery" => self.refresh_rate_config.battery,
+                "Balanced" => self.refresh_rate_config.balanced,
+                "Performance" => self.refresh_rate_config.performance,
+                _ => {
+                    log::warn!("Unknown profile '{}', skipping refresh rate change", name);
+                    0 // Will be skipped
+                }
+            };
+
+            if hz > 0 {
+                if self.ac_display_locked {
+                    log::info!(
+                        "AC display lock active — skipping refresh rate change to {}Hz for {} profile",
+                        hz, name
+                    );
+                } else {
+                    log::info!("Setting display refresh rate to {}Hz for {} profile", hz, name);
+                    if let Err(e) = crate::display::set_refresh_rate(hz) {
+                        log::warn!("Failed to set display refresh rate to {}Hz: {}", hz, e);
+                    }
+                }
+            }
+        }
 
         if self.profile_errors.is_empty() {
             Ok(())
@@ -170,6 +454,18 @@ impl System76Power {
         &mut self,
         #[zbus(signal_context)] context: zbus::SignalContext<'_>,
     ) -> zbus::fdo::Result<()> {
+        // Detect manual profile change - set override flag (but not during initial startup)
+        {
+            let mut daemon = self.0.lock().await;
+            if daemon.auto_switch_enabled 
+                && daemon.initial_set 
+                && daemon.power_profile != "Battery" 
+            {
+                log::info!("Manual profile change to Battery detected, setting override flag");
+                daemon.auto_switch_manual_override = true;
+            }
+        }
+        
         let result = self
             .0
             .lock()
@@ -189,6 +485,18 @@ impl System76Power {
         &mut self,
         #[zbus(signal_context)] context: zbus::SignalContext<'_>,
     ) -> zbus::fdo::Result<()> {
+        // Detect manual profile change - set override flag (but not during initial startup)
+        {
+            let mut daemon = self.0.lock().await;
+            if daemon.auto_switch_enabled 
+                && daemon.initial_set 
+                && daemon.power_profile != "Balanced" 
+            {
+                log::info!("Manual profile change to Balanced detected, setting override flag");
+                daemon.auto_switch_manual_override = true;
+            }
+        }
+        
         let result = self
             .0
             .lock()
@@ -208,6 +516,18 @@ impl System76Power {
         &mut self,
         #[zbus(signal_context)] context: zbus::SignalContext<'_>,
     ) -> zbus::fdo::Result<()> {
+        // Detect manual profile change - set override flag (but not during initial startup)
+        {
+            let mut daemon = self.0.lock().await;
+            if daemon.auto_switch_enabled 
+                && daemon.initial_set 
+                && daemon.power_profile != "Performance" 
+            {
+                log::info!("Manual profile change to Performance detected, setting override flag");
+                daemon.auto_switch_manual_override = true;
+            }
+        }
+        
         let result = self
             .0
             .lock()
@@ -267,6 +587,67 @@ impl System76Power {
             .graphics
             .set_vendor(GraphicsMode::from(vendor))
             .map_err(zbus_error_from_display)
+    }
+
+    /// Switch the graphics mode at runtime without a reboot.
+    ///
+    /// This method stops the active display manager, tears down the NVIDIA
+    /// driver stack, reconfigures the system, brings the stack back up for the
+    /// new mode, and restarts the display manager — all without requiring a
+    /// reboot.
+    ///
+    /// After the live switch succeeds a `GraphicsModeChanged` signal is emitted.
+    /// The initramfs rebuild (needed for the *next* boot) runs in the background;
+    /// a `GraphicsInitramfsDone` signal is emitted when it completes.
+    ///
+    /// Note: models where external displays are wired exclusively through the
+    /// dGPU (e.g. oryp*, addw*, serw*) will return an error — use `SetGraphics`
+    /// on those systems and reboot instead.
+    async fn set_graphics_runtime(
+        &mut self,
+        #[zbus(signal_context)] ctx: zbus::SignalContext<'_>,
+        vendor: &str,
+    ) -> zbus::fdo::Result<()> {
+        let mode = GraphicsMode::from(vendor);
+        let vendor_owned = vendor.to_owned();
+
+        // Perform the runtime switch (blocks until DM is back up).
+        self.0
+            .lock()
+            .await
+            .graphics
+            .switch_runtime(mode)
+            .map_err(zbus_error_from_display)?;
+
+        // Signal: the new mode is live.
+        System76Power::graphics_mode_changed(&ctx, vendor).await
+            .unwrap_or_else(|e| log::warn!("Failed to emit GraphicsModeChanged: {}", e));
+
+        // Rebuild the initramfs in a background thread so that the next boot
+        // also uses the correct modules. The D-Bus call returns immediately.
+        let ctx_owned = ctx.to_owned();
+        tokio::task::spawn_blocking(move || {
+            log::info!("Background initramfs rebuild starting");
+            let (cmd, arg) = update_initramfs_cmd();
+            let success = std::process::Command::new(cmd)
+                .arg(arg)
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            log::info!(
+                "Background initramfs rebuild {}",
+                if success { "succeeded" } else { "failed" }
+            );
+            // Emit the completion signal back on the async runtime.
+            let vendor_clone = vendor_owned.clone();
+            tokio::runtime::Handle::current().block_on(async move {
+                System76Power::graphics_initramfs_done(&ctx_owned, &vendor_clone, success)
+                    .await
+                    .unwrap_or_else(|e| log::warn!("Failed to emit GraphicsInitramfsDone: {}", e));
+            });
+        });
+
+        Ok(())
     }
 
     #[dbus_interface(out_args("desktop"))]
@@ -346,6 +727,24 @@ impl System76Power {
     async fn power_profile_switch(
         context: &zbus::SignalContext<'_>,
         profile: &str,
+    ) -> zbus::Result<()>;
+
+    /// Emitted immediately after a runtime graphics mode switch completes.
+    /// The `mode` argument is the new graphics mode string (e.g. `"hybrid"`).
+    #[dbus_interface(signal)]
+    async fn graphics_mode_changed(
+        context: &zbus::SignalContext<'_>,
+        mode: &str,
+    ) -> zbus::Result<()>;
+
+    /// Emitted when the background initramfs rebuild triggered by
+    /// `SetGraphicsRuntime` finishes. `success` is `true` if the rebuild
+    /// command exited with status 0.
+    #[dbus_interface(signal)]
+    async fn graphics_initramfs_done(
+        context: &zbus::SignalContext<'_>,
+        mode: &str,
+        success: bool,
     ) -> zbus::Result<()>;
 }
 
@@ -597,6 +996,138 @@ pub async fn daemon() -> anyhow::Result<()> {
     }
 
     system76_daemon.0.lock().await.initial_set = true;
+
+    // Create channel for AC power monitoring
+    let (power_tx, mut power_rx) = tokio::sync::mpsc::unbounded_channel();
+    
+    // Spawn async AC power monitoring task - uses Netlink uevents for instant hardware-driven detection.
+    // Retries with exponential backoff on fatal socket errors so auto-switching survives transient
+    // kernel-level failures without requiring a daemon restart.
+    tokio::spawn(async move {
+        let mut delay = Duration::from_secs(1);
+        loop {
+            match crate::power_supply::monitor_channel(power_tx.clone()).await {
+                Ok(()) => {
+                    // Channel closed cleanly (receiver dropped) — no point retrying.
+                    log::info!("AC power monitoring stopped (channel closed)");
+                    break;
+                }
+                Err(e) => {
+                    log::warn!(
+                        "AC power monitoring failed: {}. Retrying in {:?}...",
+                        e,
+                        delay
+                    );
+                    sleep(delay).await;
+                    delay = (delay * 2).min(Duration::from_secs(60));
+                }
+            }
+        }
+    });
+
+    // Handle power source changes in the async runtime
+    let daemon_clone = system76_daemon.0.clone();
+    let system76_clone = system76_daemon.clone();
+    let context_clone = context.clone();
+    
+    tokio::spawn(async move {
+        log::info!("Power source change handler started, waiting for events...");
+        while let Some(source) = power_rx.recv().await {
+            log::info!("Received power source event: {:?}", source);
+            let mut daemon = daemon_clone.lock().await;
+            
+            // Check if auto-switching is enabled
+            if !daemon.auto_switch_enabled {
+                log::debug!("Auto-switching disabled, ignoring power source change to {:?}", source);
+                continue;
+            }
+            
+            log::info!("Auto-switching is enabled, processing power source change to {:?}", source);
+            
+            // Check if user has manually overridden
+            if daemon.auto_switch_manual_override {
+                log::info!("Manual override active, clearing it due to AC power change to {:?}", source);
+                daemon.auto_switch_manual_override = false;
+            }
+            
+            // Check if display mode switching is enabled
+            if daemon.display_mode_config.enabled {
+                log::info!("Display mode switching is enabled for AC power changes");
+                
+                match source {
+                    crate::power_supply::PowerSource::AC => {
+                        log::info!("AC adapter connected, checking for AC display mode");
+                        if let Some(mode_spec) = &daemon.display_mode_config.ac_mode.clone() {
+                            if let Err(e) = crate::display::set_display_mode(mode_spec) {
+                                log::error!("Failed to set AC display mode: {}", e);
+                            } else {
+                                daemon.ac_display_locked = true;
+                                log::info!("AC display lock set — refresh rate will not change until charger is unplugged");
+                            }
+                        } else {
+                            log::warn!("Display mode switching enabled but no AC mode configured");
+                        }
+                    }
+                    crate::power_supply::PowerSource::Battery => {
+                        log::info!("On battery power, clearing AC display lock");
+                        daemon.ac_display_locked = false;
+                        log::info!("AC display lock cleared — charger unplugged");
+                        if let Some(mode_spec) = &daemon.display_mode_config.battery_mode.clone() {
+                            if let Err(e) = crate::display::set_display_mode(mode_spec) {
+                                log::error!("Failed to set battery display mode: {}", e);
+                            } else {
+                                log::info!("Battery display mode successfully applied");
+                            }
+                        } else {
+                            log::warn!("Display mode switching enabled but no battery mode configured");
+                        }
+                    }
+                }
+                
+                // Note: When display mode switching is enabled, we don't auto-switch profiles
+                // The display mode change handles both resolution and refresh rate
+                drop(daemon);
+            } else {
+                // Display mode switching disabled - fall back to profile-based auto-switching
+                log::info!("Display mode switching disabled, using profile-based auto-switching");
+                
+                // Determine target profile based on power source
+                let (target_profile, profile_func) = match source {
+                    crate::power_supply::PowerSource::AC => {
+                        log::info!("AC adapter connected, auto-switching to Balanced profile");
+                        ("Balanced", balanced as fn(&mut Vec<ProfileError>, bool))
+                    }
+                    crate::power_supply::PowerSource::Battery => {
+                        log::info!("On battery power, auto-switching to Battery profile");
+                        daemon.ac_display_locked = false;
+                        log::info!("AC display lock cleared — charger unplugged");
+                        ("Battery", battery as fn(&mut Vec<ProfileError>, bool))
+                    }
+                };
+                
+                // Apply the profile
+                match daemon.apply_profile(&context_clone, profile_func, target_profile).await {
+                    Ok(()) => {
+                        // Set the lock after a successful AC profile apply
+                        if target_profile == "Balanced" {
+                            daemon.ac_display_locked = true;
+                            log::info!("AC display lock set — refresh rate will not change until charger is unplugged");
+                        }
+                        log::info!("Auto-switch to {} profile successful", target_profile);
+                        // Drop the lock before emitting signals
+                        drop(daemon);
+                        // Emit D-Bus signals to notify clients of the profile change
+                        system76_clone.emit_active_profile_changed().await;
+                    }
+                    Err(e) => {
+                        log::error!("Auto-switch to {} profile failed: {}", target_profile, e);
+                    }
+                }
+            }
+        }
+        
+        log::warn!("Power monitoring channel closed, auto-switching stopped");
+    });
 
     // Spawn hid backlight daemon
     let _hid_backlight = thread::spawn(hid_backlight::daemon);
