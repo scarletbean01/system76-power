@@ -309,6 +309,151 @@ fn load_display_mode_config() -> crate::display::DisplayModeConfig {
     }
 }
 
+/// Load per-profile display mode configuration from /etc/system76-power.conf
+///
+/// Returns ProfileDisplayModeConfig with settings from config file or defaults
+fn load_profile_display_mode_config() -> crate::display::ProfileDisplayModeConfig {
+    use crate::display::{ModeSpec, ProfileDisplayModeConfig};
+    
+    let config_path = "/etc/system76-power.conf";
+    
+    match fs::read_to_string(config_path) {
+        Ok(content) => {
+            let mut config = ProfileDisplayModeConfig::default();
+            let mut in_section = false;
+            
+            // Temporary storage for mode components per profile
+            let mut battery_res: Option<String> = None;
+            let mut battery_hz: Option<u32> = None;
+            let mut battery_mode: Option<String> = None;
+            let mut balanced_res: Option<String> = None;
+            let mut balanced_hz: Option<u32> = None;
+            let mut balanced_mode: Option<String> = None;
+            let mut performance_res: Option<String> = None;
+            let mut performance_hz: Option<u32> = None;
+            let mut performance_mode: Option<String> = None;
+            
+            for line in content.lines() {
+                let trimmed = line.trim();
+                
+                // Check for [display_modes_profile] section
+                if trimmed == "[display_modes_profile]" {
+                    in_section = true;
+                    continue;
+                }
+                
+                // Exit section if we hit another section header
+                if trimmed.starts_with('[') && trimmed != "[display_modes_profile]" {
+                    in_section = false;
+                    continue;
+                }
+                
+                // Parse settings only within [display_modes_profile] section
+                if in_section && trimmed.contains('=') {
+                    let parts: Vec<&str> = trimmed.splitn(2, '=').collect();
+                    if parts.len() == 2 {
+                        let key = parts[0].trim();
+                        let value = parts[1].trim().trim_matches('"');
+                        
+                        match key {
+                            "enabled" => {
+                                config.enabled = value == "true";
+                            }
+                            // Battery profile settings
+                            "battery_mode" => {
+                                battery_mode = Some(value.to_string());
+                            }
+                            "battery_resolution" => {
+                                battery_res = Some(value.to_string());
+                            }
+                            "battery_refresh_rate" => {
+                                if let Ok(hz) = value.parse::<u32>() {
+                                    battery_hz = Some(hz);
+                                }
+                            }
+                            // Balanced profile settings
+                            "balanced_mode" => {
+                                balanced_mode = Some(value.to_string());
+                            }
+                            "balanced_resolution" => {
+                                balanced_res = Some(value.to_string());
+                            }
+                            "balanced_refresh_rate" => {
+                                if let Ok(hz) = value.parse::<u32>() {
+                                    balanced_hz = Some(hz);
+                                }
+                            }
+                            // Performance profile settings
+                            "performance_mode" => {
+                                performance_mode = Some(value.to_string());
+                            }
+                            "performance_resolution" => {
+                                performance_res = Some(value.to_string());
+                            }
+                            "performance_refresh_rate" => {
+                                if let Ok(hz) = value.parse::<u32>() {
+                                    performance_hz = Some(hz);
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            
+            // Build mode specs for each profile (prefer explicit mode string over resolution+rate)
+            // Battery
+            if let Some(mode_str) = battery_mode {
+                config.battery = Some(ModeSpec::ModeString(mode_str));
+            } else if let (Some(res), Some(hz)) = (battery_res, battery_hz) {
+                let res_parts: Vec<&str> = res.split('x').collect();
+                if res_parts.len() == 2 {
+                    if let (Ok(width), Ok(height)) = (res_parts[0].parse::<u32>(), res_parts[1].parse::<u32>()) {
+                        config.battery = Some(ModeSpec::ResolutionAndRate(width, height, hz));
+                    }
+                }
+            }
+            
+            // Balanced
+            if let Some(mode_str) = balanced_mode {
+                config.balanced = Some(ModeSpec::ModeString(mode_str));
+            } else if let (Some(res), Some(hz)) = (balanced_res, balanced_hz) {
+                let res_parts: Vec<&str> = res.split('x').collect();
+                if res_parts.len() == 2 {
+                    if let (Ok(width), Ok(height)) = (res_parts[0].parse::<u32>(), res_parts[1].parse::<u32>()) {
+                        config.balanced = Some(ModeSpec::ResolutionAndRate(width, height, hz));
+                    }
+                }
+            }
+            
+            // Performance
+            if let Some(mode_str) = performance_mode {
+                config.performance = Some(ModeSpec::ModeString(mode_str));
+            } else if let (Some(res), Some(hz)) = (performance_res, performance_hz) {
+                let res_parts: Vec<&str> = res.split('x').collect();
+                if res_parts.len() == 2 {
+                    if let (Ok(width), Ok(height)) = (res_parts[0].parse::<u32>(), res_parts[1].parse::<u32>()) {
+                        config.performance = Some(ModeSpec::ResolutionAndRate(width, height, hz));
+                    }
+                }
+            }
+            
+            log::info!(
+                "Per-profile display mode configuration loaded: enabled={}, battery={:?}, balanced={:?}, performance={:?}",
+                config.enabled,
+                config.battery.is_some(),
+                config.balanced.is_some(),
+                config.performance.is_some()
+            );
+            config
+        }
+        Err(_) => {
+            log::info!("No per-profile display mode configuration found, using defaults (disabled)");
+            ProfileDisplayModeConfig::default()
+        }
+    }
+}
+
 struct PowerDaemon {
     initial_set:                 bool,
     graphics:                    Graphics,
@@ -321,6 +466,7 @@ struct PowerDaemon {
     auto_switch_manual_override: bool,
     refresh_rate_config:         RefreshRateConfig,
     display_mode_config:         crate::display::DisplayModeConfig,
+    profile_display_config:      crate::display::ProfileDisplayModeConfig,
     /// True once a high-refresh display mode/rate was applied on AC power.
     /// Cleared only when the charger is unplugged (PowerSource::Battery event).
     /// While set, profile switches will not override the display refresh rate.
@@ -333,6 +479,7 @@ impl PowerDaemon {
         let auto_switch_enabled = load_auto_switch_config();
         let refresh_rate_config = load_refresh_rate_config();
         let display_mode_config = load_display_mode_config();
+        let profile_display_config = load_profile_display_mode_config();
 
         Ok(Self {
             initial_set:                 false,
@@ -346,6 +493,7 @@ impl PowerDaemon {
             auto_switch_manual_override: false,
             refresh_rate_config,
             display_mode_config,
+            profile_display_config,
             ac_display_locked:           false,
         })
     }
@@ -367,8 +515,24 @@ impl PowerDaemon {
 
         self.power_profile = name.into();
 
-        // Apply refresh rate if enabled
-        if self.refresh_rate_config.enabled {
+        // Apply display mode changes (priority: per-profile display mode > refresh rate only)
+        if self.ac_display_locked {
+            log::info!(
+                "AC display lock active — skipping display changes for {} profile",
+                name
+            );
+        } else if self.profile_display_config.enabled {
+            // Per-profile display mode configuration takes priority
+            if let Some(mode_spec) = self.profile_display_config.get(name) {
+                log::info!("Setting per-profile display mode for {} profile", name);
+                if let Err(e) = crate::display::set_display_mode(mode_spec) {
+                    log::warn!("Failed to set display mode for {} profile: {} (profile switch continues)", name, e);
+                }
+            } else {
+                log::debug!("No per-profile display mode configured for {} profile, skipping", name);
+            }
+        } else if self.refresh_rate_config.enabled {
+            // Fall back to refresh-rate-only configuration
             let hz = match name {
                 "Battery" => self.refresh_rate_config.battery,
                 "Balanced" => self.refresh_rate_config.balanced,
@@ -380,16 +544,9 @@ impl PowerDaemon {
             };
 
             if hz > 0 {
-                if self.ac_display_locked {
-                    log::info!(
-                        "AC display lock active — skipping refresh rate change to {}Hz for {} profile",
-                        hz, name
-                    );
-                } else {
-                    log::info!("Setting display refresh rate to {}Hz for {} profile", hz, name);
-                    if let Err(e) = crate::display::set_refresh_rate(hz) {
-                        log::warn!("Failed to set display refresh rate to {}Hz: {}", hz, e);
-                    }
+                log::info!("Setting display refresh rate to {}Hz for {} profile", hz, name);
+                if let Err(e) = crate::display::set_refresh_rate(hz) {
+                    log::warn!("Failed to set display refresh rate to {}Hz: {}", hz, e);
                 }
             }
         }

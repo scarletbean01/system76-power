@@ -101,6 +101,39 @@ impl Default for DisplayModeConfig {
     }
 }
 
+/// Per-profile display mode configuration
+/// Allows setting different resolution + refresh rate combinations for each power profile
+#[derive(Debug, Clone)]
+pub struct ProfileDisplayModeConfig {
+    pub enabled: bool,
+    pub battery: Option<ModeSpec>,
+    pub balanced: Option<ModeSpec>,
+    pub performance: Option<ModeSpec>,
+}
+
+impl Default for ProfileDisplayModeConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false, // Disabled by default, opt-in feature
+            battery: None,
+            balanced: None,
+            performance: None,
+        }
+    }
+}
+
+impl ProfileDisplayModeConfig {
+    /// Get the display mode for a specific profile
+    pub fn get(&self, profile: &str) -> Option<&ModeSpec> {
+        match profile {
+            "Battery" => self.battery.as_ref(),
+            "Balanced" => self.balanced.as_ref(),
+            "Performance" => self.performance.as_ref(),
+            _ => None,
+        }
+    }
+}
+
 /// Display server types
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DisplayServer {

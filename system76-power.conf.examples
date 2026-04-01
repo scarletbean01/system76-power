@@ -162,6 +162,117 @@ battery_refresh_rate = 60
 
 
 ################################################################################
+# PER-PROFILE DISPLAY MODE SWITCHING (Profile-Based)
+################################################################################
+
+[display_modes_profile]
+# Configure resolution AND refresh rate for each POWER PROFILE individually
+#
+# TRIGGER: Changes when you manually switch power profiles
+#
+# This is an advanced feature that allows different resolution + refresh rate
+# combinations for each profile (Battery, Balanced, Performance).
+#
+# IMPORTANT: When enabled, this takes priority over [refresh_rate] for manual
+# profile switches. However, [display_modes] (AC-Based) still applies on
+# plug/unplug events.
+#
+# Default: enabled = false (opt-in feature)
+#
+# BEHAVIOR WITH enabled = true:
+#   Manual profile switch to Battery     → Apply battery_resolution + battery_refresh_rate
+#   Manual profile switch to Balanced    → Apply balanced_resolution + balanced_refresh_rate
+#   Manual profile switch to Performance → Apply performance_resolution + performance_refresh_rate
+#   AC plug/unplug event                 → Apply [display_modes] settings (if enabled)
+#
+# BEHAVIOR WITH enabled = false:
+#   Manual profile switch → Changes refresh rate only (via [refresh_rate])
+#   AC plug/unplug event  → Apply [display_modes] settings (if enabled)
+#
+# USE CASES:
+# - Keep high resolution on Balanced (AC) but lower on Battery
+# - Performance profile always at native resolution + max refresh rate
+# - Prevent daemon from switching to smaller resolution unexpectedly
+# - Fine-grained control over display settings per profile
+#
+# CONFIGURATION METHODS:
+#
+# METHOD 1: Simple (Resolution + Refresh Rate per Profile)
+# - Easiest to configure
+# - Automatically finds best matching mode
+# - Prefers VRR modes when available
+# - Example:
+#     battery_resolution = "1920x1080"
+#     battery_refresh_rate = 60
+#     balanced_resolution = "2560x1440"
+#     balanced_refresh_rate = 60
+#     performance_resolution = "2560x1440"
+#     performance_refresh_rate = 165
+#
+# METHOD 2: Advanced (Explicit Mode Strings per Profile)
+# - Full control over exact mode (including VRR suffix)
+# - Use output from: gnome-randr query | grep eDP
+# - Example:
+#     battery_mode = "1920x1080@60.002"
+#     balanced_mode = "2560x1440@60.002+vrr"
+#     performance_mode = "2560x1440@165.001+vrr"
+#
+# If both methods are specified for a profile, explicit mode string takes priority.
+#
+# PRIORITY RULES:
+# 1. AC display lock active (after display_modes change) → Skip all display changes
+# 2. [display_modes_profile] enabled and mode configured → Apply per-profile display mode
+# 3. [refresh_rate] enabled → Apply refresh rate only
+# 4. None enabled → No display changes
+#
+# ERROR HANDLING:
+# - If configured resolution is not available, logs warning and skips display change
+# - Profile switch continues successfully even if display mode change fails
+# - Check logs with: journalctl -u com.system76.PowerDaemon -f
+#
+# EXAMPLE 1: Same resolution, different refresh rates (conservative)
+enabled = false
+# battery_resolution = "2560x1440"
+# battery_refresh_rate = 60
+# balanced_resolution = "2560x1440"
+# balanced_refresh_rate = 60
+# performance_resolution = "2560x1440"
+# performance_refresh_rate = 165
+
+# EXAMPLE 2: Lower resolution on Battery only
+# enabled = true
+# battery_resolution = "1920x1080"
+# battery_refresh_rate = 60
+# balanced_resolution = "2560x1440"
+# balanced_refresh_rate = 60
+# performance_resolution = "2560x1440"
+# performance_refresh_rate = 165
+
+# EXAMPLE 3: Maximum battery savings
+# enabled = true
+# battery_resolution = "1920x1080"
+# battery_refresh_rate = 60
+# balanced_resolution = "1920x1080"
+# balanced_refresh_rate = 60
+# performance_resolution = "2560x1440"
+# performance_refresh_rate = 165
+
+# EXAMPLE 4: Using explicit mode strings
+# enabled = true
+# battery_mode = "1920x1080@60.002"
+# balanced_mode = "2560x1440@60.002+vrr"
+# performance_mode = "2560x1440@165.001+vrr"
+
+# EXAMPLE 5: Hybrid approach (some profiles use mode strings, others use resolution+rate)
+# enabled = true
+# battery_mode = "1920x1080@60.002"
+# balanced_resolution = "2560x1440"
+# balanced_refresh_rate = 60
+# performance_resolution = "2560x1440"
+# performance_refresh_rate = 165
+
+
+################################################################################
 # TROUBLESHOOTING & DIAGNOSTICS
 ################################################################################
 #
@@ -220,6 +331,19 @@ battery_refresh_rate = 60
 #    - Restart daemon: sudo systemctl restart com.system76.PowerDaemon
 #    - Check file permissions: should be readable by system76-power user
 #
+# 6. Per-profile display mode not working:
+#    - Check that display_modes_profile enabled = true
+#    - Verify at least one profile has resolution/refresh_rate or mode configured
+#    - Check logs for "Per-profile display mode configuration loaded" message
+#    - Ensure AC display lock is not active (unplug charger to clear)
+#    - Remember: [display_modes] (AC-Based) takes priority on plug/unplug events
+#
+# 7. Resolution changes unexpectedly:
+#    - If using [display_modes], AC plug/unplug triggers mode changes
+#    - If using [display_modes_profile], manual profile changes trigger mode changes
+#    - Check which feature is enabled and their interaction
+#    - Consider disabling [display_modes] if you only want profile-based changes
+#
 ################################################################################
 # POWER SAVINGS REFERENCE
 ################################################################################
@@ -263,5 +387,63 @@ battery_refresh_rate = 60
 #   - External monitors are not managed
 #   - Some displays may not support all resolutions at all refresh rates
 #   - VRR support depends on display hardware and driver
+#
+################################################################################
+# FEATURE INTERACTION GUIDE
+################################################################################
+#
+# Understanding how display-related features interact:
+#
+# [refresh_rate] vs [display_modes] vs [display_modes_profile]
+#
+# These three features control display settings but at different triggers:
+#
+# 1. [refresh_rate] - Profile-Based, Refresh Rate Only
+#    Trigger: Manual profile switch OR auto-switch profile change
+#    Effect: Changes refresh rate only (keeps current resolution)
+#    Priority: Lowest (only applies if other features are disabled)
+#
+# 2. [display_modes] - AC-Based, Resolution + Refresh Rate
+#    Trigger: AC adapter plugged/unplugged (hardware event)
+#    Effect: Changes both resolution and refresh rate
+#    Priority: Highest for AC events (overrides profile-based changes)
+#    Note: Sets AC display lock - prevents further display changes until unplugged
+#
+# 3. [display_modes_profile] - Profile-Based, Resolution + Refresh Rate
+#    Trigger: Manual profile switch only
+#    Effect: Changes both resolution and refresh rate per profile
+#    Priority: Higher than [refresh_rate], but AC lock can block it
+#
+# RECOMMENDED COMBINATIONS:
+#
+# A. Simple refresh rate switching (default behavior):
+#    [refresh_rate] enabled = true
+#    [display_modes] enabled = false
+#    [display_modes_profile] enabled = false
+#
+# B. AC-based resolution + refresh rate switching:
+#    [refresh_rate] enabled = true
+#    [display_modes] enabled = true
+#    [display_modes_profile] enabled = false
+#
+# C. Profile-based resolution + refresh rate switching:
+#    [refresh_rate] enabled = true (fallback)
+#    [display_modes] enabled = false
+#    [display_modes_profile] enabled = true
+#
+# D. Maximum control (separate AC and profile modes):
+#    [refresh_rate] enabled = true (fallback)
+#    [display_modes] enabled = true
+#    [display_modes_profile] enabled = true
+#    Result: AC events use [display_modes], manual profile switches use [display_modes_profile]
+#
+# IMPORTANT NOTES:
+# - AC display lock: After [display_modes] changes the display on AC plug, it locks
+#   the display configuration. Profile switches will NOT change the display until
+#   the charger is unplugged. This prevents conflicting settings.
+# - Manual override: When you manually change a profile, auto-switching is disabled
+#   until the next AC state change. This lets you temporarily override settings.
+# - Config reload: Changes to this file require daemon restart to take effect:
+#   sudo systemctl restart com.system76.PowerDaemon
 #
 ################################################################################
