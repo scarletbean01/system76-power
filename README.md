@@ -252,6 +252,11 @@ The integrated graphics controller is used exclusively for rendering. The dGPU i
 
 ## Power Profiles
 
+> AMD power limits (RyzenAdj) are applied best effort: if `ryzenadj` is missing,
+> the SMU is unsupported, or PCI config space is write-protected, a warning is
+> logged and the rest of the profile still applies. The limits below are tuned
+> for HX-class Ryzen packages (55 W sustained); scale down for U-series parts.
+
 ### Battery
 
 Optimized for maximum battery life:
@@ -273,7 +278,7 @@ Good balance of performance and efficiency:
 - SCSI/SATA link time power management enabled
 - Intel P-State values optimized
 - PCIe ASPM set to `default`
-- **AMD (RyzenAdj):** STAPM=25W, Fast=35W, Slow=20W, Tctl=85°C
+- **AMD (RyzenAdj):** STAPM=55W, Fast=80W, Slow=80W, Tctl=95°C (HX-class package)
 
 ### Performance
 
@@ -283,7 +288,7 @@ Maximum performance:
 - ACPI Platform profile used if supported
 - PCIe ASPM set to `default`
 - I2C runtime PM disabled (lowest latency)
-- **AMD (RyzenAdj):** Maximum performance mode
+- **AMD (RyzenAdj):** STAPM=55W, Fast=80W, Slow=80W, Tctl=95°C (explicit limits, not `--max-performance`)
 
 ---
 

@@ -3,7 +3,6 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 use super::pci_runtime_pm_support;
-use crate::errors::RyzenAdjError;
 use crate::{
     Profile,
     errors::{BacklightError, ModelError, PciDeviceError, ProfileError, ScsiHostError},
@@ -109,7 +108,8 @@ pub fn balanced(errors: &mut Vec<ProfileError>, set_brightness: bool) {
         catch!(errors, model_profiles.balanced.set());
     }
 
-    catch!(errors, set_ryzen_limits(25_000, 35_000, 20_000, 85));
+    // HX-class package: 55W sustained (STAPM), 80W boost (FPPT/SPPT), 95°C Tctl
+    set_ryzen_limits(55_000, 80_000, 80_000, 95);
 
     log::info!("=== BALANCED profile applied successfully ===");
 }
@@ -166,7 +166,9 @@ pub fn performance(errors: &mut Vec<ProfileError>, _set_brightness: bool) {
         catch!(errors, model_profiles.performance.set());
     }
 
-    catch!(errors, set_ryzen_max_performance());
+    // Same envelope as balanced: explicit limits instead of ryzenadj's
+    // unbounded `--max-performance`, which also lifts every VRM limit.
+    set_ryzen_limits(55_000, 80_000, 80_000, 95);
 
     log::info!("=== PERFORMANCE profile applied successfully ===");
 }
@@ -223,65 +225,48 @@ pub fn battery(errors: &mut Vec<ProfileError>, set_brightness: bool) {
         catch!(errors, model_profiles.battery.set());
     }
 
-    catch!(errors, set_ryzen_limits(12_000, 18_000, 10_000, 60));
+    // Deep power cut for battery: 12W sustained / 18W boost / 60°C Tctl
+    set_ryzen_limits(12_000, 18_000, 10_000, 60);
 
     log::info!("=== BATTERY profile applied successfully ===");
 }
 
+/// Applies AMD SMU power limits through `ryzenadj`.
+///
+/// Values are in milliwatts (Tctl in °C). This is best effort: a missing
+/// `ryzenadj`, an unsupported SMU, or a locked PCI config space only logs a
+/// warning, so the remaining profile parameters still apply.
 fn set_ryzen_limits(
     stapm_limit: u32,
     fast_limit: u32,
     slow_limit: u32,
     tctl_temp: u32,
-) -> Result<(), RyzenAdjError> {
-    let stapm_limit_str = stapm_limit.to_string();
-    let fast_limit_str = fast_limit.to_string();
-    let slow_limit_str = slow_limit.to_string();
-    let tctl_temp_str = tctl_temp.to_string();
-
+) {
     let output = Command::new("ryzenadj")
-        .arg("--stapm-limit=".to_owned() + &stapm_limit_str)
-        .arg("--fast-limit=".to_owned() + &fast_limit_str)
-        .arg("--slow-limit=".to_owned() + &slow_limit_str)
-        .arg("--tctl-temp=".to_owned() + &tctl_temp_str)
-        .output()
-        .map_err(RyzenAdjError::CmdError)?;
+        .arg(format!("--stapm-limit={stapm_limit}"))
+        .arg(format!("--fast-limit={fast_limit}"))
+        .arg(format!("--slow-limit={slow_limit}"))
+        .arg(format!("--tctl-temp={tctl_temp}"))
+        .output();
 
-    if output.status.success() {
-        log::info!(
-            "Successfully set Ryzen limits: STAPM={}mW, Fast={}mW, Slow={}mW, Tctl={}°C",
-            stapm_limit,
-            fast_limit,
-            slow_limit,
-            tctl_temp
-        );
-        Ok(())
-    } else {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        log::warn!("Error setting Ryzen limits: {}", stderr);
-        Err(RyzenAdjError::CmdError(io::Error::new(
-            io::ErrorKind::Other,
-            "ryzenadj command failed",
-        )))
-    }
-}
-
-fn set_ryzen_max_performance() -> Result<(), RyzenAdjError> {
-    let output = Command::new("ryzenadj")
-        .arg("--max-performance".to_owned())
-        .output()
-        .map_err(RyzenAdjError::CmdError)?;
-
-    if output.status.success() {
-        log::info!("Successfully set Ryzen to max performance.");
-        Ok(())
-    } else {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        eprintln!("Error setting Ryzen to max performance: {}", stderr);
-        Err(RyzenAdjError::CmdError(io::Error::new(
-            io::ErrorKind::Other,
-            "ryzenadj command failed",
-        )))
+    match output {
+        Ok(output) if output.status.success() => {
+            log::info!(
+                "Successfully set Ryzen limits: STAPM={}mW, Fast={}mW, Slow={}mW, Tctl={}°C",
+                stapm_limit,
+                fast_limit,
+                slow_limit,
+                tctl_temp
+            );
+        }
+        Ok(output) => {
+            log::warn!(
+                "ryzenadj exited with {:?}: {}",
+                output.status.code(),
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        Err(why) => log::warn!("failed to run ryzenadj: {}", why),
     }
 }
 

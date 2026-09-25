@@ -51,6 +51,8 @@ pub struct DisplayMode {
     pub refresh_rate: f32,
     /// Whether VRR (Variable Refresh Rate) is supported
     pub has_vrr: bool,
+    /// Whether this is the mode currently applied to the display
+    pub is_current: bool,
 }
 
 /// Display refresh rate configuration
@@ -751,6 +753,7 @@ impl DisplayManager for X11Manager<'_> {
 
                             let parts: Vec<&str> = trimmed.split_whitespace().collect();
                             for part in parts.iter().skip(1) {
+                                let is_current = part.contains('*');
                                 let rate_str = part.trim_end_matches('+').trim_end_matches('*');
                                 if let Ok(rate) = rate_str.parse::<f32>() {
                                     if rate > 10.0 {
@@ -766,6 +769,7 @@ impl DisplayManager for X11Manager<'_> {
                                                 resolution: (width, height),
                                                 refresh_rate: rate,
                                                 has_vrr: false,
+                                                is_current,
                                             });
                                         }
                                     }
@@ -817,6 +821,38 @@ impl DisplayManager for X11Manager<'_> {
     }
 }
 
+/// Remove ANSI escape sequences (CSI: `ESC [ params final-byte`) from text.
+///
+/// `kscreen-doctor --outputs` colorizes its output unconditionally — it wraps the
+/// currently active mode in `ESC [01;32m ... ESC [0;0m` even when stdout is a
+/// pipe, and offers no `--no-color`/`NO_COLOR` option. Left in place, the escape
+/// bytes make that token unparseable, which silently drops the active mode from
+/// the discovered mode list (e.g. 2560x1600@60 disappearing while it is in use).
+fn strip_ansi(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+
+    while let Some(c) = chars.next() {
+        if c != '\x1b' {
+            out.push(c);
+            continue;
+        }
+
+        if chars.peek() == Some(&'[') {
+            chars.next();
+            // Consume parameter bytes until the final byte (0x40..=0x7e)
+            while let Some(&next) = chars.peek() {
+                chars.next();
+                if ('\x40'..='\x7e').contains(&next) {
+                    break;
+                }
+            }
+        }
+    }
+
+    out
+}
+
 /// KDE Wayland backend — uses `kscreen-doctor`
 struct KdeManager<'a> {
     ctx: &'a SessionContext,
@@ -835,7 +871,7 @@ impl DisplayManager for KdeManager<'_> {
             });
         }
 
-        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stdout = strip_ansi(&String::from_utf8_lossy(&output.stdout));
         log::debug!("kscreen-doctor output:\n{}", stdout);
 
         // Parse the multi-line output format:
@@ -1061,7 +1097,14 @@ fn parse_gnome_mode_line(line: &str) -> Option<DisplayMode> {
         has_vrr
     );
 
-    Some(DisplayMode { mode_string, resolution: (width, height), refresh_rate, has_vrr })
+    // gnome-randr does not mark the active mode in a machine-readable way here
+    Some(DisplayMode {
+        mode_string,
+        resolution: (width, height),
+        refresh_rate,
+        has_vrr,
+        is_current: false,
+    })
 }
 
 /// Parse xrandr mode line
@@ -1083,6 +1126,7 @@ fn parse_xrandr_mode_line(line: &str, resolution: &str) -> Option<DisplayMode> {
     // Find refresh rates (numbers with optional + or *)
     // The first rate is usually the active one (marked with *)
     for i in 1..parts.len() {
+        let is_current = parts[i].contains('*');
         let rate_str = parts[i].trim_end_matches('+').trim_end_matches('*');
         if let Ok(rate) = rate_str.parse::<f32>() {
             let mode_string = format!("{}@{:.2}", resolution, rate);
@@ -1098,6 +1142,7 @@ fn parse_xrandr_mode_line(line: &str, resolution: &str) -> Option<DisplayMode> {
                 resolution: (width, height),
                 refresh_rate: rate,
                 has_vrr: false, // X11 doesn't report VRR in mode strings
+                is_current,
             });
         }
     }
@@ -1143,6 +1188,8 @@ fn parse_kscreen_modes(modes_str: &str) -> Vec<DisplayMode> {
                         resolution: (width, height),
                         refresh_rate: rate,
                         has_vrr: false, // kscreen-doctor doesn't report VRR in mode listing
+                        // '*' marks the mode currently applied to the output
+                        is_current: mode_token.contains('*'),
                     });
                 }
             }
@@ -1154,11 +1201,11 @@ fn parse_kscreen_modes(modes_str: &str) -> Vec<DisplayMode> {
 
 /// Find the best matching mode for a target refresh rate
 /// Prefers VRR modes if available, and selects closest matching rate
-fn find_best_mode(
-    modes: &[DisplayMode],
+fn find_best_mode<'a>(
+    modes: &[&'a DisplayMode],
     target_rate: u32,
     prefer_vrr: bool,
-) -> Option<&DisplayMode> {
+) -> Option<&'a DisplayMode> {
     if modes.is_empty() {
         log::warn!("No modes available for matching");
         return None;
@@ -1174,27 +1221,29 @@ fn find_best_mode(
     let target_f32 = target_rate as f32;
 
     // First, try to find VRR modes if preferred
-    let candidates = if prefer_vrr {
-        let vrr_modes: Vec<_> = modes.iter().filter(|m| m.has_vrr).collect();
-        if !vrr_modes.is_empty() {
-            log::debug!("Found {} VRR modes, preferring those", vrr_modes.len());
-            vrr_modes
-        } else {
+    let vrr_modes: Option<Vec<&'a DisplayMode>> = if prefer_vrr {
+        let vrr_modes: Vec<&'a DisplayMode> = modes.iter().copied().filter(|m| m.has_vrr).collect();
+        if vrr_modes.is_empty() {
             log::debug!("No VRR modes found, using all {} modes", modes.len());
-            modes.iter().collect()
+            None
+        } else {
+            log::debug!("Found {} VRR modes, preferring those", vrr_modes.len());
+            Some(vrr_modes)
         }
     } else {
-        modes.iter().collect()
+        None
     };
 
     // Find the closest match by refresh rate
-    let best = candidates
+    let best = vrr_modes
+        .as_deref()
+        .unwrap_or(modes)
         .iter()
+        .copied()
         .min_by_key(|mode| {
             let diff = (mode.refresh_rate - target_f32).abs();
             (diff * 1000.0) as u32 // Convert to millihertz for integer comparison
-        })
-        .copied();
+        });
 
     if let Some(mode) = best {
         log::info!(
@@ -1209,6 +1258,30 @@ fn find_best_mode(
     }
 
     best
+}
+
+/// Candidate modes for a refresh-rate-only change.
+///
+/// A refresh rate change must not alter the resolution, so when the backend
+/// reports the active mode the candidates are restricted to modes of the same
+/// resolution (always non-empty: the active mode itself is included). Falls
+/// back to every mode when the active mode is unknown (e.g. gnome-randr).
+fn modes_for_rate_change(modes: &[DisplayMode]) -> Vec<&DisplayMode> {
+    let Some(resolution) = modes.iter().find(|m| m.is_current).map(|m| m.resolution) else {
+        return modes.iter().collect();
+    };
+
+    let same_resolution: Vec<&DisplayMode> =
+        modes.iter().filter(|m| m.resolution == resolution).collect();
+
+    log::info!(
+        "Keeping current resolution {}x{} ({} matching modes)",
+        resolution.0,
+        resolution.1,
+        same_resolution.len()
+    );
+
+    same_resolution
 }
 
 /// Set display refresh rate based on detected display server
@@ -1237,7 +1310,10 @@ pub fn set_refresh_rate(rate: u32) -> Result<(), DisplayError> {
 
     log::info!("Target display: {}", display_name);
 
-    let best_mode = find_best_mode(&available_modes, rate, true).ok_or_else(|| {
+    // A refresh rate change must not alter the resolution.
+    let candidates = modes_for_rate_change(&available_modes);
+
+    let best_mode = find_best_mode(&candidates, rate, true).ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::NotFound,
             format!("No suitable mode found for {}Hz on {}", rate, display_name),
@@ -1351,10 +1427,9 @@ fn select_best_mode(
         }
         ModeSpec::ResolutionAndRate(width, height, hz) => {
             // Filter modes by resolution
-            let filtered: Vec<_> = available_modes
+            let filtered: Vec<&DisplayMode> = available_modes
                 .iter()
                 .filter(|m| m.resolution.0 == *width && m.resolution.1 == *height)
-                .cloned()
                 .collect();
 
             if filtered.is_empty() {
@@ -1441,5 +1516,66 @@ mod tests {
         assert_eq!(config.battery, 60);
         assert_eq!(config.performance, 165);
         assert!(config.enabled);
+    }
+
+    /// Real `kscreen-doctor --outputs` output colorizes the active mode with ANSI
+    /// escapes. That token used to be dropped, losing the active mode entirely.
+    #[test]
+    fn test_strip_ansi_and_parse_kscreen_current_mode() {
+        let colorized = "Modes:  1:2560x1600@240.00!  \
+                         2:\x1b[01;32m2560x1600@60.00*\x1b[0;0m  \
+                         3:1920x1200@240.00  19:2560x1440@59.96";
+        let modes_str = strip_ansi(colorized).replace("Modes:", "");
+
+        let modes = parse_kscreen_modes(&modes_str);
+
+        assert_eq!(modes.len(), 4, "active mode must not be dropped");
+        let current = modes.iter().find(|m| m.is_current).expect("active mode marked");
+        assert_eq!(current.resolution, (2560, 1600));
+        assert_eq!(current.refresh_rate, 60.0);
+    }
+
+    #[test]
+    fn test_strip_ansi_removes_escapes_only() {
+        assert_eq!(strip_ansi("\x1b[01;32m2560x1600@60.00*\x1b[0;0m"), "2560x1600@60.00*");
+        assert_eq!(strip_ansi("plain text"), "plain text");
+    }
+
+    fn mode(width: u32, height: u32, rate: f32, is_current: bool) -> DisplayMode {
+        DisplayMode {
+            mode_string: format!("{}x{}@{}", width, height, rate as u32),
+            resolution: (width, height),
+            refresh_rate: rate,
+            has_vrr: false,
+            is_current,
+        }
+    }
+
+    /// Battery profile sets 60Hz: the panel's 2560x1440@59.96 mode must not win
+    /// over the active resolution's 2560x1600@60 mode.
+    #[test]
+    fn test_rate_change_keeps_active_resolution() {
+        let modes = vec![
+            mode(2560, 1600, 240.0, true),
+            mode(2560, 1600, 60.0, false),
+            mode(2560, 1440, 59.96, false),
+        ];
+
+        let candidates = modes_for_rate_change(&modes);
+        let best = find_best_mode(&candidates, 60, true).expect("mode found");
+
+        assert_eq!(best.resolution, (2560, 1600));
+        assert_eq!(best.refresh_rate, 60.0);
+    }
+
+    #[test]
+    fn test_rate_change_without_current_mode_uses_all_modes() {
+        let modes = vec![mode(2560, 1600, 240.0, false), mode(2560, 1440, 60.0, false)];
+
+        let candidates = modes_for_rate_change(&modes);
+        let best = find_best_mode(&candidates, 60, true).expect("mode found");
+
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(best.resolution, (2560, 1440));
     }
 }
