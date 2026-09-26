@@ -75,17 +75,17 @@ Legend: `[ ]` pending · `[~]` in progress · `[x]` done · `[!]` blocked.
 
 ## Step 9 — Hygiene
 
-- [ ] 9.1 `version()` returns `concat!("system76-power ", env!("CARGO_PKG_VERSION"))`.
-- [ ] 9.2 `data/com.system76.PowerDaemon.xml`: add `AutoGraphicsPower`, `SetGraphicsRuntime`, `GraphicsModeChanged`, `GraphicsInitramfsDone`.
-- [ ] 9.3 `fan.rs:53` + `hid_backlight.rs:98`: restore commented logs at `debug!`.
-- [ ] 9.4 repo `system76-power.conf`: `[display_modes] enabled = false`; keep `performance = 240`.
-- [ ] 9.5 `Makefile`: `sysconfdir ?= /etc` + separate `install-config` target (not in `install`).
-- [ ] 9.6 README: config path fix, SIGHUP, all sections+defaults, override semantics, `dim_on_battery`, `install-config`, `doctor`.
-- [ ] 9.7 `cargo build && cargo test` green.
+- [x] 9.1 `version()` returns `concat!("system76-power ", env!("CARGO_PKG_VERSION"))`.
+- [x] 9.2 `data/com.system76.PowerDaemon.xml`: add `AutoGraphicsPower`, `SetGraphicsRuntime`, `GraphicsModeChanged`, `GraphicsInitramfsDone`.
+- [x] 9.3 `fan.rs:53` + `hid_backlight.rs:98`: restore commented logs at `debug!`.
+- [x] 9.4 repo `system76-power.conf`: `[display_modes] enabled = false`; keep `performance = 240`.
+- [x] 9.5 `Makefile`: `sysconfdir ?= /etc` + separate `install-config` target (not in `install`).
+- [x] 9.6 README: config path fix, SIGHUP, all sections+defaults, override semantics, `dim_on_battery`, `install-config`, `doctor`.
+- [x] 9.7 `cargo build && cargo test` green.
 
 ## Verification
 
-- [ ] V1 Build + unit tests after each step (new config/charge tests pass; fan/display/power_supply unchanged).
+- [x] V1 Build + unit tests after each step (32 unit tests pass).
 - [ ] V2 Install + daemon active (`install-auto-switch.sh`, `systemctl restart`, `is-active`).
 - [ ] V3 SIGHUP reload logs `configuration reloaded` + re-apply.
 - [ ] V4 Battery profile knobs (boost/EPP/ASPM/iw/snd/radeon-dpm/USB tally/ryzenadj).
@@ -116,4 +116,5 @@ Legend: `[ ]` pending · `[~]` in progress · `[x]` done · `[!]` blocked.
 - Step 7 done (dGPU runtime D3: new `MODPROBE_HYBRID` template = `options nvidia NVreg_DynamicPowerManagement=0x02`, selected for `GraphicsMode::Hybrid`; `MODPROBE_COMPUTE` gained the same option line but kept its `nvidia-drm`/`nvidia-modeset` blacklists — a literal "Compute → MODPROBE_HYBRID" would have dropped those and let the dGPU attach to displays, i.e. broken compute-only mode). This host: AD106M RTX 4070 Max-Q + Raphael iGPU, NVIDIA modules loaded, `/etc/modprobe.d/system76-power.conf` currently only S3 `NVreg_PreserveVideoMemoryAllocations` (pre-change binary). `cargo test` 24 passed.
 - Step 8 done (`system76-power doctor`: new `src/doctor.rs` `run() -> anyhow::Result<bool>` — read-only, no daemon; active profile from `platform_profile` (low-power/quiet→Battery, balanced, performance) or `auto_switch`+power-supply fallback, unknown profile ⇒ profile-dependent checks SKIP; per-knob `OK`/`DRIFT`/`SKIP` for ACPI platform profile, CPU boost, governor, EPP (incl. battery availability fallback), laptop_mode, dirty_writeback, PCIe ASPM (bracketed active policy), HDA power save, `iw` Wi-Fi power save, rfkill bluetooth, SMU (always SKIP); final `N OK, N DRIFT, N SKIP`, exit 1 on any DRIFT; dispatched in `client.rs` before the zbus connection so it runs with the daemon stopped; 7 pure unit tests for the mapping/expectation/parse/classify helpers). `main.rs` unchanged (Doctor falls into the `_ => client::client(&args)` arm); `Cargo.toml` unchanged. `cargo build` green.
 - ReviewStep8 (external review): 1 critical + 3 minor findings. Fixed: (a) `doctor` no longer asserts Bluetooth soft-block `0` on non-Battery profiles — `apply_device_policies` only blocks on battery and never unblocks, so a user-off Bluetooth on AC produced a false `DRIFT`/exit 1; the check now SKIPs outside Battery via the new pure `bluetooth_expectation()` (+ regression test). (b) `set_charge_thresholds` no longer raises the end threshold to 100 when the platform has no start attribute (momentary uncap + redundant write); the pre-write is now conditional and the comment matches the kernel constraint (start must not exceed the current end). (c) `find_thresholds` sorts `BAT*` candidates so `BAT0` deterministically wins on multi-battery systems. Rejected (with reason): moving the doctor dispatch from `client.rs` to `main.rs` — tracker 8.2 specifies the client dispatch and the current-thread runtime is already created for every client invocation. `cargo test` 32 passed.
-- STOP POINT: `cargo build` green; `cargo test` 32 passed (incl. 8 doctor tests). Next: Step 9 (Hygiene).
+- Step 9 done (hygiene: `version()` now reports `env!("CARGO_PKG_VERSION")` (1.2.8, was hardcoded 1.2.1); D-Bus introspection XML gains `AutoGraphicsPower`, `SetGraphicsRuntime(vendor)`, `GraphicsModeChanged(mode)`, `GraphicsInitramfsDone(mode, success)` — validated with `xmllint`; the two commented logs restored at `debug!` (fan.rs discover error, hid_backlight missing kbd_backlight); repo `system76-power.conf` `[display_modes] enabled = false` with `performance = 240` kept; Makefile gained `sysconfdir ?= /etc` plus `install-config`/`uninstall-config` targets that are deliberately NOT part of `install` (`make -n install` touches no conf file); README documents `[profile] [usb] [audio] [wifi] [pci] [radio] [cpu]` defaults, `dim_on_battery`, the `doctor` subcommand with sample output, and the `install-config` step). `cargo test` 32 passed.
+- STOP POINT: plan complete (all of Steps 1-9). Remaining work is hardware verification only (V2-V9: install + daemon restart, SIGHUP reload, per-profile knob tally, Legion conservation_mode, dGPU D3 after reboot, doctor clean path).

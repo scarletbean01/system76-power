@@ -357,6 +357,85 @@ battery_refresh_rate = 60
 # Get mode strings from: gnome-randr query | grep eDP
 # ac_mode = "2560x1440@165.001+vrr"
 # battery_mode = "1920x1080@60.002"
+
+
+#-------------------------------------------------------------------------------
+# Profile: Battery-profile display dimming
+#-------------------------------------------------------------------------------
+[profile]
+# Dim the screen and turn off the keyboard backlight when the BATTERY profile is
+# applied (opt-in; other profiles never touch brightness)
+dim_on_battery = false
+
+
+#-------------------------------------------------------------------------------
+# USB: Device autosuspend
+#-------------------------------------------------------------------------------
+[usb]
+# Autosuspend USB devices under battery/balanced (minus blacklists);
+# performance always sets `on`
+autosuspend = true
+
+# Interface drivers never autosuspended (space-separated)
+blacklist_drivers = "usblp"
+
+# Devices never autosuspended, as lowercase `vid:pid` (space-separated)
+blacklist = ""
+
+
+#-------------------------------------------------------------------------------
+# Audio: HDA power saving
+#-------------------------------------------------------------------------------
+[audio]
+# Enable HDA controller/device power-save on battery/balanced, clear it for
+# performance
+power_save = true
+
+
+#-------------------------------------------------------------------------------
+# Wi-Fi: Radio power saving
+#-------------------------------------------------------------------------------
+[wifi]
+# Enable `iw` power-save on battery, disable it for balanced/performance
+power_save = true
+
+
+#-------------------------------------------------------------------------------
+# PCI: Runtime power management
+#-------------------------------------------------------------------------------
+[pci]
+# Enable runtime PM on battery/balanced, disable it for performance
+runtime_pm = true
+
+# Drivers never touched (space-separated)
+blacklist_drivers = "amdgpu nvidia nouveau radeon"
+
+
+#-------------------------------------------------------------------------------
+# Radio: Bluetooth on battery
+#-------------------------------------------------------------------------------
+[radio]
+# Soft-block Bluetooth while on battery (never unblocked automatically)
+bluetooth_off_on_battery = false
+
+
+#-------------------------------------------------------------------------------
+# CPU: AMD SMU limits and energy preference
+#-------------------------------------------------------------------------------
+[cpu]
+# AMD SMU limits in milliwatts, applied through `ryzenadj` (best effort).
+# Defaults suit an HX-class package (55W sustained); scale down for U-series.
+battery_stapm_mw = 12000
+battery_fast_mw = 18000
+battery_slow_mw = 10000
+battery_tctl_c = 60
+ac_stapm_mw = 55000
+ac_fast_mw = 80000
+ac_slow_mw = 80000
+ac_tctl_c = 95
+
+# `energy_performance_preference` for the battery profile on `amd-pstate-epp`
+battery_epp = "power"
 ```
 
 ### Example Configurations
@@ -429,6 +508,31 @@ system76-power profile battery
 system76-power profile balanced
 system76-power profile performance
 ```
+
+### Doctor
+
+Audit that the configured power settings are actually in effect. `doctor` is
+read-only, needs no root, and talks to neither the daemon nor D-Bus, so it also
+works while the daemon is stopped. Every knob is reported as `OK` (in effect),
+`DRIFT` (configured but not in effect) or `SKIP` (not auditable on this system);
+the exit code is `1` when at least one knob drifted.
+
+```bash
+system76-power doctor
+```
+
+```
+Active profile: Battery (from /sys/firmware/acpi/platform_profile=low-power)
+OK     ACPI platform profile: low-power (expected low-power)
+DRIFT  CPU boost: 1 (expected 0)
+SKIP   SMU/ryzenadj limits: requires root to read the SMU table
+2 OK, 1 DRIFT, 1 SKIP
+```
+
+The active profile is inferred from `/sys/firmware/acpi/platform_profile`;
+without platform-profile support it falls back to the power-supply state when
+`[auto_switch]` is enabled, and profile-dependent knobs report `SKIP` when the
+profile cannot be determined.
 
 ### Graphics
 
@@ -613,6 +717,10 @@ cargo build --release
 
 # Install
 sudo make install
+
+# Optionally install the sample configuration (never done by `make install`,
+# so upgrades cannot overwrite an existing /etc/system76-power.conf)
+sudo make install-config
 
 # Enable and start service
 sudo systemctl enable --now system76-power

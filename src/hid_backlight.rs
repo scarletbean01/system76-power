@@ -98,6 +98,7 @@ pub fn daemon() {
         dir = Path::new("/sys/class/leds/system76::kbd_backlight");
     }
     if !dir.is_dir() {
+        log::debug!("hid_backlight: no kbd_backlight control");
         return;
     }
 

@@ -47,6 +47,12 @@
     <method name="SetGraphicsPower">
       <arg name="power" type="b" direction="in"/>
     </method>
+
+    <method name="AutoGraphicsPower"></method>
+
+    <method name="SetGraphicsRuntime">
+      <arg name="vendor" type="s" direction="in"/>
+    </method>
     
     <method name="GetSwitchable">
       <arg name="switchable" type="b" direction="out"/>
@@ -62,6 +68,15 @@
 
     <signal name="PowerProfileSwitch">
       <arg name="profile" type="s"/>
+    </signal>
+
+    <signal name="GraphicsModeChanged">
+      <arg name="mode" type="s"/>
+    </signal>
+
+    <signal name="GraphicsInitramfsDone">
+      <arg name="mode" type="s"/>
+      <arg name="success" type="b"/>
     </signal>
   </interface>
 

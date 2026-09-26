@@ -4,10 +4,11 @@ bindir = $(exec_prefix)/bin
 libdir = $(exec_prefix)/lib
 includedir = $(prefix)/include
 datadir = $(prefix)/share
+sysconfdir ?= /etc
 
 SRC = Cargo.toml Cargo.lock Makefile $(shell find src -type f -wholename '*src/*.rs')
 
-.PHONY: all clean distclean install uninstall update
+.PHONY: all clean distclean install install-config uninstall uninstall-config update
 
 BIN=system76-power
 ID=com.system76.PowerDaemon
@@ -37,6 +38,14 @@ install: all
 	install -D -m 0644 "data/$(ID).service" "$(DESTDIR)$(libdir)/systemd/system/$(ID).service"
 	install -D -m 0644 "data/$(ID).xml" "$(DESTDIR)$(datadir)/dbus-1/interfaces/$(ID).xml"
 	install -D -m 0755 "target/release/$(BIN)" "$(DESTDIR)$(bindir)/$(BIN)"
+
+# The sample configuration is installed explicitly, never as part of `install`,
+# so that packaging and updates cannot overwrite an existing /etc file.
+install-config:
+	install -D -m 0644 "system76-power.conf" "$(DESTDIR)$(sysconfdir)/system76-power.conf"
+
+uninstall-config:
+	rm -f "$(DESTDIR)$(sysconfdir)/system76-power.conf"
 
 uninstall:
 	rm -f "$(DESTDIR)$(bindir)/$(ID)"
