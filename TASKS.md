@@ -1,0 +1,115 @@
+# system76-power fork → sophisticated TLP replacement — execution tracker
+
+Source plan: `local://s76-power-tlp-replacement-plan.md` (durable copy).
+Repo: `/home/deplague/Projects/system76-power` (HEAD `b57b871`, v1.2.8).
+Upstream reference tree: `/home/deplague/Projects/system76-power-original` (HEAD `9a33472`).
+Toolchain: `devenv shell -- cargo` (cargo 1.98.1).
+
+Legend: `[ ]` pending · `[~]` in progress · `[x]` done · `[!]` blocked.
+
+---
+
+## Step 1 — Port two upstream fixes
+
+- [x] 1.1 `src/graphics/nvidia.rs`: replace `supported_gpus` collection with upstream `nvidia-kernel-common`-aware filter_map; keep `len() != 1` error.
+- [x] 1.2 `src/hotplug/mod.rs`: re-add `addp6` and `oryp14` arms (data-only), before final `other => Err(...)`.
+- [x] 1.3 Do NOT port upstream `1c8a14f` coreboot gate on deferred `power/control` write.
+- [x] 1.4 `cargo build && cargo test` green.
+
+## Step 2 — One real config subsystem (`src/config.rs`)
+
+- [x] 2.1 New `src/config.rs`: `CONFIG_PATH`, `Config` struct with `auto_switch`, `refresh_rate`, `display_modes`, `profile`, `usb`, `audio`, `wifi`, `pci`, `radio`, `cpu`.
+- [x] 2.2 Move `RefreshRateConfig` + `DisplayModeConfig` into `config.rs` (not copy); field semantics unchanged.
+- [x] 2.3 `load()`/`parse(&str)` section-aware INI parser; unknown section/key → `warn!`; missing file → defaults; malformed value → `warn!` + default.
+- [x] 2.4 `static CONFIG: RwLock<Config>`; `current() -> Config`, `reload() -> Config`.
+- [x] 2.5 Exact defaults per plan (auto_switch true, refresh 60/60/165, display_modes false, dim_on_battery false, usb autosuspend true/blacklist_drivers "usblp", audio true, wifi true, pci runtime_pm true/blacklist_drivers "amdgpu nvidia nouveau radeon", radio false, cpu battery_epp "power" + SMU/tctl values).
+- [x] 2.6 `#[cfg(test)] mod tests`: defaults-on-missing, full parse of repo conf, section-unawareness regression, malformed→default+no panic, unknown section ignored.
+- [x] 2.7 `src/lib.rs`: add `pub mod config;`. Delete three `load_*_config` fns + call sites; `PowerDaemon` fields removed; use `config::current()` at use sites.
+- [x] 2.8 `cargo build && cargo test` green.
+
+## Step 3 — SIGHUP reload + apply-after-reload
+
+- [x] 3.1 `signal_handling()`: `SIGINT|SIGTERM → CONTINUE=false, break`; `SIGHUP → config::reload(); log; re-apply current profile` (reset `power_profile` first).
+- [x] 3.2 README documents `sudo kill -HUP $(pidof system76-power)`.
+- [x] 3.3 `cargo build && cargo test` green.
+
+## Step 4 — Fix auto-switch bugs
+
+- [x] 4.1 Compositing: remove display-mode/profile either-or split; per event: (a) display mode if enabled, (b) then profile unless override consumed event.
+- [x] 4.2 Override flag: set on manual profile set (D-Bus battery/balanced/performance + UPower ActiveProfile setter) when `auto_switch_enabled && !initial_set`; AC handler consumes it and logs skip.
+- [x] 4.3 Brightness gating: `set_brightness = initial_set || config::current().profile.dim_on_battery`.
+- [x] 4.4 `cargo build && cargo test` green.
+
+## Step 5 — Device-level knobs in profiles
+
+- [x] 5.1 USB: `sys_devices::usb::{driver_name(), ids()}`, warn-on-write-error; profiles auto/on + blacklists.
+- [x] 5.2 Audio: `SoundDevice::get_devices().set_power_save(...)` gated on `audio.power_save`.
+- [x] 5.3 Wi-Fi: rewrite `src/wifi.rs` `set_power_save(bool)` via `iw`; battery on / balanced+perf off.
+- [x] 5.4 PCI: delete `S76_POWER_PCI_RUNTIME_PM`/`PCI_RUNTIME_PM`/`pci_runtime_pm_support()`; gate on `pci.runtime_pm`; `pci::driver_name()` + blacklist skip (driverless NOT skipped).
+- [x] 5.5 Radio: `sys_devices::rfkill` module; battery soft=1 / others soft=0, gated on `radio.bluetooth_off_on_battery`.
+- [x] 5.6 CPU: configurable battery EPP with available-preferences validation; extract `governor_for`/`epp_for`.
+- [x] 5.7 SMU limits configurable via `config::current().cpu`.
+- [x] 5.8 `cargo build && cargo test` green.
+
+## Step 6 — Charge thresholds off System76 firmware
+
+- [ ] 6.1 `Mechanism` enum + `detect()` (Thresholds generic / Conservation `conservation_mode` / None).
+- [ ] 6.2 `set_charge_thresholds` handles optional start file; Conservation write `1` if `end<=70` else `0`.
+- [ ] 6.3 `get_charge_thresholds` reads pair or maps conservation `(50,60)`/`(90,100)`.
+- [ ] 6.4 unit tests for the two pure mappings.
+- [ ] 6.5 `cargo build && cargo test` green.
+
+## Step 7 — dGPU runtime D3
+
+- [ ] 7.1 `MODPROBE_HYBRID` template with `NVreg_DynamicPowerManagement=0x02`.
+- [ ] 7.2 `write_vendor_config` maps Hybrid|Compute → `MODPROBE_HYBRID`.
+- [ ] 7.3 `cargo build && cargo test` green.
+
+## Step 8 — `doctor` subcommand
+
+- [ ] 8.1 `args.rs`: `Doctor` variant.
+- [ ] 8.2 `client.rs`: dispatch `Doctor` before zbus connection.
+- [ ] 8.3 New `src/doctor.rs` `run()`: per-knob `OK`/`DRIFT`/`SKIP`; exit 0 if zero DRIFT else 1.
+- [ ] 8.4 `lib.rs` + `main.rs` wiring.
+- [ ] 8.5 `cargo build && cargo test` green.
+
+## Step 9 — Hygiene
+
+- [ ] 9.1 `version()` returns `concat!("system76-power ", env!("CARGO_PKG_VERSION"))`.
+- [ ] 9.2 `data/com.system76.PowerDaemon.xml`: add `AutoGraphicsPower`, `SetGraphicsRuntime`, `GraphicsModeChanged`, `GraphicsInitramfsDone`.
+- [ ] 9.3 `fan.rs:53` + `hid_backlight.rs:98`: restore commented logs at `debug!`.
+- [ ] 9.4 repo `system76-power.conf`: `[display_modes] enabled = false`; keep `performance = 240`.
+- [ ] 9.5 `Makefile`: `sysconfdir ?= /etc` + separate `install-config` target (not in `install`).
+- [ ] 9.6 README: config path fix, SIGHUP, all sections+defaults, override semantics, `dim_on_battery`, `install-config`, `doctor`.
+- [ ] 9.7 `cargo build && cargo test` green.
+
+## Verification
+
+- [ ] V1 Build + unit tests after each step (new config/charge tests pass; fan/display/power_supply unchanged).
+- [ ] V2 Install + daemon active (`install-auto-switch.sh`, `systemctl restart`, `is-active`).
+- [ ] V3 SIGHUP reload logs `configuration reloaded` + re-apply.
+- [ ] V4 Battery profile knobs (boost/EPP/ASPM/iw/snd/radeon-dpm/USB tally/ryzenadj).
+- [ ] V5 Balanced profile knobs revert.
+- [ ] V6 Charge thresholds on Legion (`conservation_mode` 1/0, query mapping).
+- [ ] V7 dGPU D3 (`NVreg` line + post-reboot `runtime_status=suspended`).
+- [ ] V8 `doctor` exit 0 clean, exit 1 on induced boost drift.
+- [ ] V9 Auto-switch composite path + manual override log.
+
+## Progress log
+
+- 2026-09-26: tracker created; baseline `cargo build` OK, `cargo test` 13 passed.
+- Step 1 done (nvidia-kernel-common discovery, addp6/oryp14 arms). Step 2 done (new src/config.rs, loaders deleted, display structs consolidated).
+- ReviewStep12 (reviewer): overall_correctness=correct; 1 low-impact finding (quoted-value comment stripping) -> fixed + regression test. `cargo test` 21 passed.
+- Step 3 done (SIGHUP reloads config + re-applies the active profile; signal streams now created before the D-Bus name is acquired). ReviewStep3 (reviewer): found the handler-install timing defect (default SIGHUP disposition before first poll) -> fixed by creating `signal()` streams at the top of `daemon()`; README config path fixed + SIGHUP documented.
+- Step 4 done (AC handler composites display-mode + profile switching; manual override armed by D-Bus battery/balanced/performance and the UPower setter, consuming exactly one event; brightness gated on `initial_set || dim_on_battery`). ReviewStep4 (reviewer): overall_correctness=correct; 1 informational finding (extra same-profile guard on override arming — behaviorally equivalent, no fix required).
+- Step 5 done (USB autosuspend w/ driver+vid:pid blacklists + warn-on-failure writes; HDA power-save; Wi-Fi `iw` power-save; PCI runtime PM via config with blacklisted-driver skip; rfkill bluetooth soft-block; configurable battery EPP with availability fallback; SMU limits from `[cpu]`). Ready 5.4 removed `S76_POWER_PCI_RUNTIME_PM`/`PCI_RUNTIME_PM`/`pci_runtime_pm_support`; dead `PowerLevel` removed.
+- ReviewStep5 (reviewer): overall_correctness=correct. 3 dead-code findings -> fixed: removed orphaned `modprobe::reload`, deleted `PciDeviceError` + `ProfileError::PciDevice`, dropped unused `I2cDevice::driver_name`.
+- External review round (report supplied by user): fixed all 3 blocking items + strongly-recommended ones:
+  - (3.1) one `config::current()` snapshot per profile fn + `&Config` threaded through pci/device-policy helpers; single snapshot in `apply_profile`.
+  - (3.2) `rfkill::set_soft` now takes `bool` (kernel rfkill ABI only accepts 0/1).
+  - (3.6) `set_power_control` skips absent `power/control` at debug level (USB interface nodes no longer spam warnings); real write errors still `warn!`.
+  - (3.8) shipped `system76-power.conf` now documents `[profile] [usb] [audio] [wifi] [pci] [radio] [cpu]` with defaults.
+  - (3.10) dropped redundant `Path::new` + unused import in `wifi.rs`.
+  - Rejected as invalid: (3.3) `signal_handling` DOES `break` on SIGINT/SIGTERM (verified daemon/mod.rs:69-71). Intentional per plan: (3.4) `power_profile` blanking before re-apply; (3.7) `battery_epp = "power"` default.
+- FinalReview (subagent): found P2 real defect — `set_brightness = initial_set || dim_on_battery` made the new `dim_on_battery` knob dead (`initial_set` is permanently true post-startup), so dimming stayed always-on. Fixed to `set_brightness = config.profile.dim_on_battery` (implements the plan's stated 'unconditional-true becomes opt-in' intent). Reviewer confirmed: config-snapshot refactor complete, `set_soft(bool)`/`set_power_control` correct, parser/AC-handler/reload/cpufreq/wifi clean, no residual dead code, and the 3.3 claim rejected.
+- STOP POINT: `cargo build` green; `cargo test` 21 passed. Next: Step 6 (charge thresholds: Thresholds/Conservation mechanisms).

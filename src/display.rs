@@ -11,6 +11,7 @@
 use std::io;
 use std::process::Command;
 
+use crate::config::ModeSpec;
 use crate::errors::DisplayError;
 
 /// Compositor processes to search for, in priority order
@@ -53,54 +54,6 @@ pub struct DisplayMode {
     pub has_vrr: bool,
     /// Whether this is the mode currently applied to the display
     pub is_current: bool,
-}
-
-/// Display refresh rate configuration
-#[derive(Debug, Clone)]
-pub struct RefreshRateConfig {
-    pub enabled: bool,
-    pub battery: u32,
-    pub balanced: u32,
-    pub performance: u32,
-}
-
-impl Default for RefreshRateConfig {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            battery: 60,      // Power saving on battery
-            balanced: 60,     // Conservative on AC
-            performance: 165, // Max refresh for Razer Blade 14 and similar
-        }
-    }
-}
-
-/// Display mode specification - can be explicit mode string or resolution + refresh rate
-#[derive(Debug, Clone)]
-pub enum ModeSpec {
-    /// Explicit mode string (e.g., "2560x1440@165.001+vrr")
-    ModeString(String),
-    /// Resolution and refresh rate (width, height, hz)
-    ResolutionAndRate(u32, u32, u32),
-}
-
-/// Display mode configuration for AC auto-switching
-/// This allows changing both resolution and refresh rate when plugging/unplugging AC
-#[derive(Debug, Clone)]
-pub struct DisplayModeConfig {
-    pub enabled: bool,
-    pub ac_mode: Option<ModeSpec>,
-    pub battery_mode: Option<ModeSpec>,
-}
-
-impl Default for DisplayModeConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false, // Disabled by default, opt-in feature
-            ac_mode: None,
-            battery_mode: None,
-        }
-    }
 }
 
 /// Display server types
@@ -1508,14 +1461,6 @@ mod tests {
     fn test_detect_display_server() {
         // Just verify it doesn't crash
         let _ = detect_display_server();
-    }
-
-    #[test]
-    fn test_refresh_rate_config_default() {
-        let config = RefreshRateConfig::default();
-        assert_eq!(config.battery, 60);
-        assert_eq!(config.performance, 165);
-        assert!(config.enabled);
     }
 
     /// Real `kscreen-doctor --outputs` output colorizes the active mode with ANSI

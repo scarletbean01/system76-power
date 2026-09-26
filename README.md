@@ -294,7 +294,16 @@ Maximum performance:
 
 ## Configuration
 
-Configuration file: `/etc/system76-power/system76-power.conf`
+Configuration file: `/etc/system76-power.conf`
+
+Reload the configuration without restarting the daemon:
+
+```bash
+sudo kill -HUP $(pidof system76-power)
+```
+
+On `SIGHUP` the file is re-read and the active profile is re-applied immediately,
+so changes to any section below take effect at once.
 
 ### Full Configuration Reference
 
@@ -530,7 +539,7 @@ sudo system76-power daemon --verbose
 
 3. **Verify configuration:**
    ```bash
-   cat /etc/system76-power/system76-power.conf
+   cat /etc/system76-power.conf
    # Ensure [auto_switch] enabled = true
    ```
 

@@ -123,7 +123,6 @@ dynamic_parameters! {
     RadeonPowerMethod { radeon_power_method: "{}/power_method" },
     RadeonPowerProfile { radeon_power_profile: "{}/power_profile" },
     PowerSave { power_save: "/sys/module/{}/parameters/power_save" },
-    PowerLevel { power_level: "/sys/module/{}/parameters/power_level" },
     PowerSaveController {
         power_save_controller: "/sys/module/{}/parameters/power_save_controller"
     }

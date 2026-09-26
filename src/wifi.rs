@@ -2,62 +2,50 @@
 //
 // SPDX-License-Identifier: GPL-3.0-only
 
-use crate::{
-    kernel_parameters::{DeviceList, KernelParameter, PowerLevel, PowerSave},
-    modprobe,
-};
-use std::path::Path;
+//! Wi-Fi power-save control.
+//!
+//! Sets the per-interface power-save state through `iw`, which works with any
+//! cfg80211/mac80211 driver (including the MT7922) instead of reloading a
+//! specific vendor module.
 
-pub struct WifiDevice {
-    device:      &'static str,
-    power_save:  PowerSave,
-    power_level: PowerLevel,
-}
+use std::{fs, process::Command};
 
-impl WifiDevice {
-    #[must_use]
-    pub fn new(device: &'static str) -> Option<Self> {
-        if !Path::new(&["/sys/module/", device].concat()).exists() {
-            return None;
-        }
+/// Enables or disables 802.11 power save on every wireless interface.
+pub fn set_power_save(on: bool) {
+    let value = if on { "on" } else { "off" };
+    let interfaces = wireless_interfaces();
 
-        Some(Self {
-            device,
-            power_save: PowerSave::new(device),
-            power_level: PowerLevel::new(device),
-        })
+    if interfaces.is_empty() {
+        log::debug!("no wireless interfaces found for power-save control");
     }
 
-    pub fn set(&self, power_level: u8) {
-        if power_level > 5 {
-            log::error!("invalid wifi power level. levels supported: 1-5");
-            return;
-        }
-
-        if let (Some(ref save), Some(ref level)) = (self.power_save.get(), self.power_level.get()) {
-            if power_level == 0 {
-                if save == "Y" {
-                    if let Err(why) = modprobe::reload(self.device, &["power_save=N"]) {
-                        log::error!("failed to reload {} module: {}", self.device, why);
-                    }
-                }
-            } else {
-                let power_level = power_level.to_string();
-                if save != "Y" || (save == "N" && level != &power_level) {
-                    let options = &["power_save=Y", &format!("power_level={}", power_level)];
-                    if let Err(why) = modprobe::reload(self.device, options) {
-                        log::error!("failed to reload {} module: {}", self.device, why);
-                    }
-                }
+    for interface in interfaces {
+        match Command::new("iw")
+            .args(["dev", &interface, "set", "power_save", value])
+            .output()
+        {
+            Ok(output) if output.status.success() => {
+                log::info!("iw dev {}: power_save {}", interface, value);
             }
+            Ok(output) => log::warn!(
+                "iw dev {} set power_save {} failed: {}",
+                interface,
+                value,
+                String::from_utf8_lossy(&output.stderr).trim()
+            ),
+            Err(why) => log::warn!("failed to run iw for {}: {}", interface, why),
         }
     }
 }
 
-impl DeviceList<Self> for WifiDevice {
-    const SUPPORTED: &'static [&'static str] = &["iwlwifi"];
+/// Names of `/sys/class/net/*` entries that are wireless (`phy80211` present).
+fn wireless_interfaces() -> Vec<String> {
+    let Ok(dir) = fs::read_dir("/sys/class/net") else {
+        return Vec::new();
+    };
 
-    fn get_devices() -> Box<dyn Iterator<Item = Self>> {
-        Box::new(Self::SUPPORTED.iter().filter_map(|dev| Self::new(dev)))
-    }
+    dir.filter_map(Result::ok)
+        .filter(|entry| entry.path().join("phy80211").exists())
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect()
 }

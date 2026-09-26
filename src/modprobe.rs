@@ -4,10 +4,6 @@
 
 use std::{io, process::Command};
 
-pub fn reload(module: &str, options: &[&str]) -> io::Result<()> {
-    unload(module).and_then(|()| load(module, options))
-}
-
 pub fn unload(module: &str) -> io::Result<()> {
     log::info!("Unloading module named {}", module);
     Command::new("modprobe").args(["-r", module]).status().and_then(|stat| {

@@ -2,12 +2,13 @@
 //
 // SPDX-License-Identifier: GPL-3.0-only
 
-use super::pci_runtime_pm_support;
 use crate::{
     Profile,
-    errors::{BacklightError, ModelError, PciDeviceError, ProfileError, ScsiHostError},
+    config,
+    errors::{BacklightError, ModelError, ProfileError, ScsiHostError},
     kernel_parameters::{DeviceList, Dirty, KernelParameter, LaptopMode, PcieAspm},
     radeon::RadeonDevice,
+    snd::SoundDevice,
     sys_devices,
 };
 use intel_pstate::{PState, PStateError, PStateValues};
@@ -18,7 +19,7 @@ use std::{
     process::Command,
 };
 use sysfs_class::{
-    Backlight, Brightness, Leds, PciDevice, RuntimePM, RuntimePowerManagement, ScsiHost, SysClass,
+    Backlight, Brightness, Leds, RuntimePowerManagement, ScsiHost, SysClass,
 };
 
 /// Instead of returning on the first error, we want to collect all errors that occur while
@@ -36,6 +37,7 @@ macro_rules! catch {
 /// Sets parameters for the balanced profile.
 pub fn balanced(errors: &mut Vec<ProfileError>, set_brightness: bool) {
     log::info!("=== Applying BALANCED profile ===");
+    let config = config::current();
 
     // Use the ACPI Platform Profile if the hardware is supported by the kernel.
     if crate::acpi_platform::supported() {
@@ -74,10 +76,10 @@ pub fn balanced(errors: &mut Vec<ProfileError>, set_brightness: bool) {
         );
     }
 
-    // Parameters which may cause on certain systems.
-    if pci_runtime_pm_support() {
+    // Parameters which may cause issues on certain systems.
+    if config.pci.runtime_pm {
         // Enables PCI device runtime power management.
-        catch!(errors, pci_device_runtime_pm(RuntimePowerManagement::On));
+        pci_device_runtime_pm(RuntimePowerManagement::On, &config);
     }
 
     // Set to balanced profile.
@@ -108,8 +110,11 @@ pub fn balanced(errors: &mut Vec<ProfileError>, set_brightness: bool) {
         catch!(errors, model_profiles.balanced.set());
     }
 
-    // HX-class package: 55W sustained (STAPM), 80W boost (FPPT/SPPT), 95°C Tctl
-    set_ryzen_limits(55_000, 80_000, 80_000, 95);
+    // HX-class package: sustained (STAPM), boost (FPPT/SPPT) and Tctl from config.
+    let cpu = &config.cpu;
+    set_ryzen_limits(cpu.ac_stapm_mw, cpu.ac_fast_mw, cpu.ac_slow_mw, cpu.ac_tctl_c);
+
+    apply_device_policies(Profile::Balanced, &config);
 
     log::info!("=== BALANCED profile applied successfully ===");
 }
@@ -117,6 +122,7 @@ pub fn balanced(errors: &mut Vec<ProfileError>, set_brightness: bool) {
 /// Sets parameters for the performance profile
 pub fn performance(errors: &mut Vec<ProfileError>, _set_brightness: bool) {
     log::info!("=== Applying PERFORMANCE profile ===");
+    let config = config::current();
 
     // Use the ACPI Platform Profile if the hardware is supported by the kernel.
     if crate::acpi_platform::supported() {
@@ -150,8 +156,8 @@ pub fn performance(errors: &mut Vec<ProfileError>, _set_brightness: bool) {
         )
     );
 
-    if pci_runtime_pm_support() {
-        catch!(errors, pci_device_runtime_pm(RuntimePowerManagement::Off));
+    if config.pci.runtime_pm {
+        pci_device_runtime_pm(RuntimePowerManagement::Off, &config);
     }
 
     // Default PCIe ASPM for performance (safe, minimal power management)
@@ -168,7 +174,10 @@ pub fn performance(errors: &mut Vec<ProfileError>, _set_brightness: bool) {
 
     // Same envelope as balanced: explicit limits instead of ryzenadj's
     // unbounded `--max-performance`, which also lifts every VRM limit.
-    set_ryzen_limits(55_000, 80_000, 80_000, 95);
+    let cpu = &config.cpu;
+    set_ryzen_limits(cpu.ac_stapm_mw, cpu.ac_fast_mw, cpu.ac_slow_mw, cpu.ac_tctl_c);
+
+    apply_device_policies(Profile::Performance, &config);
 
     log::info!("=== PERFORMANCE profile applied successfully ===");
 }
@@ -176,6 +185,7 @@ pub fn performance(errors: &mut Vec<ProfileError>, _set_brightness: bool) {
 /// Sets parameters for the battery profile
 pub fn battery(errors: &mut Vec<ProfileError>, set_brightness: bool) {
     log::info!("=== Applying BATTERY profile ===");
+    let config = config::current();
 
     // Use the ACPI Platform Profile if the hardware is supported by the kernel.
     if crate::acpi_platform::supported() {
@@ -209,8 +219,8 @@ pub fn battery(errors: &mut Vec<ProfileError>, set_brightness: bool) {
         catch!(errors, iterate_backlights(Leds::iter_keyboards(), &Brightness::set_brightness, 0));
     }
 
-    if pci_runtime_pm_support() {
-        catch!(errors, pci_device_runtime_pm(RuntimePowerManagement::On));
+    if config.pci.runtime_pm {
+        pci_device_runtime_pm(RuntimePowerManagement::On, &config);
     }
 
     // Enable aggressive PCIe ASPM for battery savings
@@ -225,8 +235,16 @@ pub fn battery(errors: &mut Vec<ProfileError>, set_brightness: bool) {
         catch!(errors, model_profiles.battery.set());
     }
 
-    // Deep power cut for battery: 12W sustained / 18W boost / 60°C Tctl
-    set_ryzen_limits(12_000, 18_000, 10_000, 60);
+    // Deep power cut for battery: sustained / boost / Tctl from config.
+    let cpu = &config.cpu;
+    set_ryzen_limits(
+        cpu.battery_stapm_mw,
+        cpu.battery_fast_mw,
+        cpu.battery_slow_mw,
+        cpu.battery_tctl_c,
+    );
+
+    apply_device_policies(Profile::Battery, &config);
 
     log::info!("=== BATTERY profile applied successfully ===");
 }
@@ -298,20 +316,82 @@ fn iterate_backlights<B: Brightness>(
     Ok(())
 }
 
-/// Iterates on all available PCI devices, disabling or enabling runtime power mangement.
-fn pci_device_runtime_pm(pm: RuntimePowerManagement) -> Result<(), PciDeviceError> {
-    for device in PciDevice::iter() {
-        match device {
-            Ok(device) => device
-                .set_runtime_pm(pm)
-                .map_err(|why| PciDeviceError::SetRuntimePm(device.id().to_owned(), why))?,
-            Err(why) => {
-                log::warn!("failed to iterate PCI device: {}", why);
+/// Iterates over all PCI devices, setting runtime power management.
+///
+/// When enabling runtime PM (`On`), devices bound to a blacklisted driver are
+/// skipped. Driverless devices are deliberately NOT skipped: that is what lets
+/// an unused discrete GPU reach D3. Disabling (`Off`) applies to every device.
+fn pci_device_runtime_pm(pm: RuntimePowerManagement, config: &config::Config) {
+    for device in sys_devices::pci::devices() {
+        if pm == RuntimePowerManagement::On {
+            if let Some(driver) = device.driver_name() {
+                if config.pci.blacklist_drivers.iter().any(|entry| entry == &driver) {
+                    log::debug!("leaving blacklisted driver '{}' out of PCI runtime PM", driver);
+                    continue;
+                }
             }
+        }
+
+        device.set_runtime_pm(pm);
+    }
+}
+
+/// Applies the USB, audio, Wi-Fi and Bluetooth radio policies for a profile.
+fn apply_device_policies(profile: Profile, config: &config::Config) {
+    // USB autosuspend: `auto` on battery/balanced (minus blacklists), `on` on performance.
+    if config.usb.autosuspend {
+        usb_runtime_pm(config, !matches!(profile, Profile::Performance));
+    }
+
+    // HDA power-save timeout.
+    if config.audio.power_save {
+        let enable = !matches!(profile, Profile::Performance);
+        for device in SoundDevice::get_devices() {
+            device.set_power_save(if enable { 1 } else { 0 }, enable);
         }
     }
 
-    Ok(())
+    // Wi-Fi power-save.
+    if config.wifi.power_save {
+        crate::wifi::set_power_save(matches!(profile, Profile::Battery));
+    }
+
+    // Bluetooth soft-block on battery only (opt-in).
+    // We only *block* automatically; we never unblock, because the user may
+    // have turned Bluetooth off manually and expects it to stay off.
+    if config.radio.bluetooth_off_on_battery && matches!(profile, Profile::Battery) {
+        for device in sys_devices::rfkill::devices() {
+            if device.kind().as_deref() == Some("bluetooth") {
+                device.set_soft(true);
+            }
+        }
+    }
+}
+
+/// Sets USB runtime PM, honouring the configured driver/device blacklists when
+/// autosuspending.
+fn usb_runtime_pm(config: &config::Config, autosuspend: bool) {
+    for device in sys_devices::usb::devices() {
+        if !autosuspend {
+            device.set_runtime_pm(RuntimePowerManagement::Off);
+            continue;
+        }
+
+        if let Some(driver) = device.driver_name() {
+            if config.usb.blacklist_drivers.iter().any(|entry| entry == &driver) {
+                continue;
+            }
+        }
+
+        if let Some((vendor, product)) = device.ids() {
+            let id = format!("{}:{}", vendor, product);
+            if config.usb.blacklist.iter().any(|entry| entry == &id) {
+                continue;
+            }
+        }
+
+        device.set_runtime_pm(RuntimePowerManagement::On);
+    }
 }
 
 /// Iterates on all available SCSI/SATA hosts, setting the first link time power mangement policy

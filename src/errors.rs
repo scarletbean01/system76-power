@@ -13,8 +13,6 @@ pub enum ProfileError {
     DiskPower(#[from] DiskPowerError),
     #[error("failed to set model profiles: {0}")]
     Model(#[from] ModelError),
-    #[error("failed to set pci device profiles: {0}")]
-    PciDevice(#[from] PciDeviceError),
     #[error("failed to set pstate profiles: {0}")]
     PState(#[from] PStateError),
     #[error("failed to set scsi host profiles: {0}")]
@@ -57,12 +55,6 @@ pub enum ModelError {
     MsrWrite(io::Error),
     #[error("failed to set TCC: {}", _0)]
     Tcc(io::Error),
-}
-
-#[derive(Debug, thiserror::Error)]
-pub enum PciDeviceError {
-    #[error("failed to set PCI device runtime PM on {}: {}", _0, _1)]
-    SetRuntimePm(String, io::Error),
 }
 
 #[derive(Debug, thiserror::Error)]

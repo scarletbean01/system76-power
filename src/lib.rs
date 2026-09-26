@@ -16,6 +16,7 @@ pub mod acpi_platform;
 pub mod args;
 pub mod charge_thresholds;
 pub mod client;
+pub mod config;
 pub mod cpufreq;
 pub mod daemon;
 pub mod display;

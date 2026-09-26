@@ -21,39 +21,26 @@ pub fn set(profile: Profile, max_percent: u8) {
     if let Some(driver) = core.scaling_driver() {
         log::info!("  Detected CPU scaling driver: {}", driver);
 
-        // The profile for the `energy_performance_preference`.
-        let mut epp = None;
+        // Decide the scaling governor and EPP preference for this profile.
+        let governor = governor_for(profile, driver);
+        let mut epp = epp_for(profile, driver);
 
-        // Decide the scaling governor to use with this profile.
-        let governor = match profile {
-            // Prefer battery life over efficiency
-            Profile::Battery => match driver {
-                "amd-pstate" | "intel_pstate" => "powersave",
-                "amd-pstate-epp" => {
-                    epp = Some("balance_power");
-                    "powersave"
+        // The battery EPP is user-configurable; fall back if the CPU does not
+        // advertise it.
+        if matches!(profile, Profile::Battery) {
+            if let Some(ref preference) = epp {
+                if !epp_available(preference) {
+                    log::warn!(
+                        "  EPP preference '{}' is not available; falling back to 'balance_power'",
+                        preference
+                    );
+                    epp = Some("balance_power".to_string());
                 }
-                _ => "conservative",
-            },
-            // The most energy-efficient profile
-            Profile::Balanced => match driver {
-                "amd-pstate" => "ondemand",
-                "amd-pstate-epp" => {
-                    epp = Some("balance_performance");
-                    "powersave"
-                }
-                "intel_pstate" => "powersave",
-                _ => "schedutil",
-            },
-            // Maximum performance
-            Profile::Performance => {
-                epp = (driver == "amd-pstate-epp").then_some("performance");
-                "performance"
             }
-        };
+        }
 
         log::info!("  Selected governor: {}", governor);
-        if let Some(pref) = epp {
+        if let Some(ref pref) = epp {
             log::info!("  EPP preference: {}", pref);
         }
 
@@ -80,7 +67,7 @@ pub fn set(profile: Profile, max_percent: u8) {
 
                 core.set_governor(governor);
 
-                if let Some(preference) = epp {
+                if let Some(preference) = &epp {
                     core.set_epp(preference);
                 }
             }
@@ -94,6 +81,53 @@ pub fn set(profile: Profile, max_percent: u8) {
         set_boost(profile);
     } else {
         log::error!("  Failed to detect CPU scaling driver - cannot configure CPU frequency");
+    }
+}
+
+/// Scaling governor for the given profile and CPU scaling driver.
+#[must_use]
+pub fn governor_for(profile: Profile, driver: &str) -> &'static str {
+    match profile {
+        // Prefer battery life over efficiency.
+        Profile::Battery => match driver {
+            "amd-pstate" | "amd-pstate-epp" | "intel_pstate" => "powersave",
+            _ => "conservative",
+        },
+        // The most energy-efficient profile.
+        Profile::Balanced => match driver {
+            "amd-pstate" => "ondemand",
+            "amd-pstate-epp" | "intel_pstate" => "powersave",
+            _ => "schedutil",
+        },
+        // Maximum performance.
+        Profile::Performance => "performance",
+    }
+}
+
+/// EPP (`energy_performance_preference`) for the given profile and driver, if
+/// the driver supports it. The battery preference is user-configurable.
+#[must_use]
+pub fn epp_for(profile: Profile, driver: &str) -> Option<String> {
+    if driver != "amd-pstate-epp" {
+        return None;
+    }
+
+    Some(match profile {
+        Profile::Battery => crate::config::current().cpu.battery_epp.clone(),
+        Profile::Balanced => "balance_performance".to_string(),
+        Profile::Performance => "performance".to_string(),
+    })
+}
+
+/// Whether the CPU advertises `preference` in its available EPP list.
+fn epp_available(preference: &str) -> bool {
+    const PATH: &str =
+        "/sys/devices/system/cpu/cpu0/cpufreq/energy_performance_available_preferences";
+
+    match fs::read_to_string(PATH) {
+        Ok(available) => available.split_ascii_whitespace().any(|entry| entry == preference),
+        // Unknown; let the write attempt decide.
+        Err(_) => true,
     }
 }
 
