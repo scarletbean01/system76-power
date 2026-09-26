@@ -53,25 +53,25 @@ Legend: `[ ]` pending · `[~]` in progress · `[x]` done · `[!]` blocked.
 
 ## Step 6 — Charge thresholds off System76 firmware
 
-- [ ] 6.1 `Mechanism` enum + `detect()` (Thresholds generic / Conservation `conservation_mode` / None).
-- [ ] 6.2 `set_charge_thresholds` handles optional start file; Conservation write `1` if `end<=70` else `0`.
-- [ ] 6.3 `get_charge_thresholds` reads pair or maps conservation `(50,60)`/`(90,100)`.
-- [ ] 6.4 unit tests for the two pure mappings.
-- [ ] 6.5 `cargo build && cargo test` green.
+- [x] 6.1 `Mechanism` enum + `detect()` (Thresholds generic / Conservation `conservation_mode` / None).
+- [x] 6.2 `set_charge_thresholds` handles optional start file; Conservation write `1` if `end<=70` else `0`.
+- [x] 6.3 `get_charge_thresholds` reads pair or maps conservation `(50,60)`/`(90,100)`.
+- [x] 6.4 unit tests for the two pure mappings.
+- [x] 6.5 `cargo build && cargo test` green.
 
 ## Step 7 — dGPU runtime D3
 
-- [ ] 7.1 `MODPROBE_HYBRID` template with `NVreg_DynamicPowerManagement=0x02`.
-- [ ] 7.2 `write_vendor_config` maps Hybrid|Compute → `MODPROBE_HYBRID`.
-- [ ] 7.3 `cargo build && cargo test` green.
+- [x] 7.1 `MODPROBE_HYBRID` template with `NVreg_DynamicPowerManagement=0x02`.
+- [x] 7.2 `write_vendor_config` maps Hybrid|Compute → the D3 options (Hybrid → `MODPROBE_HYBRID`, Compute → `MODPROBE_COMPUTE` keeping its nvidia-drm/modeset blacklists + the option line).
+- [x] 7.3 `cargo build && cargo test` green.
 
 ## Step 8 — `doctor` subcommand
 
-- [ ] 8.1 `args.rs`: `Doctor` variant.
-- [ ] 8.2 `client.rs`: dispatch `Doctor` before zbus connection.
-- [ ] 8.3 New `src/doctor.rs` `run()`: per-knob `OK`/`DRIFT`/`SKIP`; exit 0 if zero DRIFT else 1.
-- [ ] 8.4 `lib.rs` + `main.rs` wiring.
-- [ ] 8.5 `cargo build && cargo test` green.
+- [x] 8.1 `args.rs`: `Doctor` variant.
+- [x] 8.2 `client.rs`: dispatch `Doctor` before zbus connection.
+- [x] 8.3 New `src/doctor.rs` `run()`: per-knob `OK`/`DRIFT`/`SKIP`; exit 0 if zero DRIFT else 1.
+- [x] 8.4 `lib.rs` + `main.rs` wiring.
+- [x] 8.5 `cargo build && cargo test` green.
 
 ## Step 9 — Hygiene
 
@@ -112,4 +112,8 @@ Legend: `[ ]` pending · `[~]` in progress · `[x]` done · `[!]` blocked.
   - (3.10) dropped redundant `Path::new` + unused import in `wifi.rs`.
   - Rejected as invalid: (3.3) `signal_handling` DOES `break` on SIGINT/SIGTERM (verified daemon/mod.rs:69-71). Intentional per plan: (3.4) `power_profile` blanking before re-apply; (3.7) `battery_epp = "power"` default.
 - FinalReview (subagent): found P2 real defect — `set_brightness = initial_set || dim_on_battery` made the new `dim_on_battery` knob dead (`initial_set` is permanently true post-startup), so dimming stayed always-on. Fixed to `set_brightness = config.profile.dim_on_battery` (implements the plan's stated 'unconditional-true becomes opt-in' intent). Reviewer confirmed: config-snapshot refactor complete, `set_soft(bool)`/`set_power_control` correct, parser/AC-handler/reload/cpufreq/wifi clean, no residual dead code, and the 3.3 claim rejected.
-- STOP POINT: `cargo build` green; `cargo test` 21 passed. Next: Step 6 (charge thresholds: Thresholds/Conservation mechanisms).
+- Step 6 done (charge thresholds no longer gated on System76/Huawei/ThinkPad firmware: `Mechanism::{Thresholds{start,end},Conservation,None}` + `detect()` scanning `/sys/class/power_supply/BAT*/charge_control_end_threshold` then the ideapad driver's `conservation_mode`; Thresholds path tolerates a missing start attribute (reports 0); Conservation writes `1` for `end<=70` else `0` and maps `1 -> (50,60)`, `0 -> (90,100)`; the old vendor-ACPI `is_supported()` gate and `supports_thresholds()` are gone). Smoke on the Legion (non-root): mechanism detected as `Conservation(/sys/bus/platform/drivers/ideapad_acpi/VPC2004:00/conservation_mode)`, `get` returned `Ok((50,60))` with `conservation_mode=1`, set attempted the conservation write (EACCES without root), validation errors intact. `cargo test` 24 passed.
+- Step 7 done (dGPU runtime D3: new `MODPROBE_HYBRID` template = `options nvidia NVreg_DynamicPowerManagement=0x02`, selected for `GraphicsMode::Hybrid`; `MODPROBE_COMPUTE` gained the same option line but kept its `nvidia-drm`/`nvidia-modeset` blacklists — a literal "Compute → MODPROBE_HYBRID" would have dropped those and let the dGPU attach to displays, i.e. broken compute-only mode). This host: AD106M RTX 4070 Max-Q + Raphael iGPU, NVIDIA modules loaded, `/etc/modprobe.d/system76-power.conf` currently only S3 `NVreg_PreserveVideoMemoryAllocations` (pre-change binary). `cargo test` 24 passed.
+- Step 8 done (`system76-power doctor`: new `src/doctor.rs` `run() -> anyhow::Result<bool>` — read-only, no daemon; active profile from `platform_profile` (low-power/quiet→Battery, balanced, performance) or `auto_switch`+power-supply fallback, unknown profile ⇒ profile-dependent checks SKIP; per-knob `OK`/`DRIFT`/`SKIP` for ACPI platform profile, CPU boost, governor, EPP (incl. battery availability fallback), laptop_mode, dirty_writeback, PCIe ASPM (bracketed active policy), HDA power save, `iw` Wi-Fi power save, rfkill bluetooth, SMU (always SKIP); final `N OK, N DRIFT, N SKIP`, exit 1 on any DRIFT; dispatched in `client.rs` before the zbus connection so it runs with the daemon stopped; 7 pure unit tests for the mapping/expectation/parse/classify helpers). `main.rs` unchanged (Doctor falls into the `_ => client::client(&args)` arm); `Cargo.toml` unchanged. `cargo build` green.
+- ReviewStep8 (external review): 1 critical + 3 minor findings. Fixed: (a) `doctor` no longer asserts Bluetooth soft-block `0` on non-Battery profiles — `apply_device_policies` only blocks on battery and never unblocks, so a user-off Bluetooth on AC produced a false `DRIFT`/exit 1; the check now SKIPs outside Battery via the new pure `bluetooth_expectation()` (+ regression test). (b) `set_charge_thresholds` no longer raises the end threshold to 100 when the platform has no start attribute (momentary uncap + redundant write); the pre-write is now conditional and the comment matches the kernel constraint (start must not exceed the current end). (c) `find_thresholds` sorts `BAT*` candidates so `BAT0` deterministically wins on multi-battery systems. Rejected (with reason): moving the doctor dispatch from `client.rs` to `main.rs` — tracker 8.2 specifies the client dispatch and the current-thread runtime is already created for every client invocation. `cargo test` 32 passed.
+- STOP POINT: `cargo build` green; `cargo test` 32 passed (incl. 8 doctor tests). Next: Step 9 (Hygiene).

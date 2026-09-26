@@ -126,4 +126,6 @@ pub enum Args {
         )]
         thresholds: Vec<u8>,
     },
+    #[clap(about = "Audit that the configured power settings are actually in effect")]
+    Doctor,
 }

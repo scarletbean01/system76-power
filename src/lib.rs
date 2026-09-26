@@ -20,6 +20,7 @@ pub mod config;
 pub mod cpufreq;
 pub mod daemon;
 pub mod display;
+pub mod doctor;
 pub mod errors;
 pub mod fan;
 pub mod graphics;

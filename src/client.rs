@@ -52,6 +52,16 @@ async fn profile(client: &mut PowerDaemonProxy<'_>) -> io::Result<()> {
 
 #[tokio::main(flavor = "current_thread")]
 pub async fn client(args: &Args) -> anyhow::Result<()> {
+    // The doctor audit is read-only and works with the daemon stopped, so it
+    // must run before any D-Bus connection is attempted.
+    if let Args::Doctor = args {
+        let clean = crate::doctor::run()?;
+        if !clean {
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
+
     let connection =
         zbus::Connection::system().await.context("failed to create zbus system connection")?;
 
@@ -180,6 +190,7 @@ Charge thresholds are not supported on desktop computers.
 
             Ok(())
         }
+        Args::Doctor => unreachable!(),
         Args::Daemon { .. } => unreachable!(),
     }
 }
