@@ -15,6 +15,7 @@ This fork extends the original [System76 power management daemon](https://github
 - [Switchable Graphics](#switchable-graphics)
 - [Power Profiles](#power-profiles)
 - [Configuration](#configuration)
+- [Charge Thresholds](#charge-thresholds)
 - [CLI Reference](#cli-reference)
 - [Desktop Environment Compatibility](#desktop-environment-compatibility)
 - [Troubleshooting](#troubleshooting)
@@ -27,9 +28,14 @@ This fork extends the original [System76 power management daemon](https://github
 | Feature | Description |
 |---------|-------------|
 | **AC Power Auto-Switching** | Automatically switch power profiles when AC adapter is plugged/unplugged |
+| **Configurable Device Policies** | `[profile] [usb] [audio] [wifi] [pci] [radio] [cpu]` sections drive every knob per profile |
 | **Display Refresh Rate Management** | Per-profile refresh rate settings (e.g., 165Hz on performance, 60Hz on battery) |
 | **Display Mode Switching** | Change resolution AND refresh rate based on AC power state |
 | **Runtime GPU Switching** | Switch graphics modes without rebooting |
+| **dGPU Runtime D3** | `NVreg_DynamicPowerManagement=0x02` for hybrid/compute modes |
+| **Charge Thresholds** | Generic `charge_control_*` sysfs or Lenovo `conservation_mode` |
+| **`doctor` Audit** | Read-only per-knob `OK`/`DRIFT`/`SKIP` report; works without root or daemon |
+| **SIGHUP Reload** | Re-read the config and re-apply the active profile without restarting |
 | **KDE Wayland Support** | Display management for KDE Plasma via `kscreen-doctor` |
 | **AMD P-State Fixes** | Proper frequency scaling for `amd-pstate` and `amd-pstate-epp` drivers |
 | **RyzenAdj Integration** | Fine-grained AMD CPU power limit control |
@@ -232,6 +238,12 @@ Applications must use [GLVND](https://gitlab.freedesktop.org/glvnd/libglvnd) to 
 **Runtime Power Management:**
 GPU support for run-time power management is required for the device to enter a low power state when not used. Only Turing cards and newer fully implement this functionality.
 
+For `hybrid` and `compute` modes this fork writes
+`options nvidia NVreg_DynamicPowerManagement=0x02` (fine-grained runtime D3) to
+`/etc/modprobe.d/system76-power.conf`; `compute` additionally keeps the
+`nvidia-drm`/`nvidia-modeset` blacklists so the dGPU never joins the display
+pipeline.
+
 ```bash
 # Check if your GPU supports runtime PM
 cat /sys/bus/pci/devices/0000:01:00.0/device
@@ -256,6 +268,11 @@ The integrated graphics controller is used exclusively for rendering. The dGPU i
 > the SMU is unsupported, or PCI config space is write-protected, a warning is
 > logged and the rest of the profile still applies. The limits below are tuned
 > for HX-class Ryzen packages (55 W sustained); scale down for U-series parts.
+
+Device-level policy (USB autosuspend, HDA power-save, Wi-Fi power-save, PCI
+runtime PM, Bluetooth blocking) is configurable per profile through the
+`[usb] [audio] [wifi] [pci] [radio]` sections — see [Configuration](#configuration).
+Run `system76-power doctor` to verify what actually took effect.
 
 ### Battery
 
@@ -492,6 +509,38 @@ ac_refresh_rate = 60
 battery_resolution = "1280x720"
 battery_refresh_rate = 48
 ```
+
+---
+
+## Charge Thresholds
+
+Limit battery charging to extend battery lifespan. The mechanism is detected at
+runtime, so no firmware-specific configuration is needed:
+
+| Mechanism | Detection | Behaviour |
+|-----------|-----------|-----------|
+| Generic sysfs pair | `BAT*/charge_control_end_threshold` (start optional) | Writes the requested `(start, end)`; end-only platforms report `start = 0` |
+| Lenovo conservation mode | `ideapad_acpi/*/conservation_mode` | `1` (charge to ~60%) when `end <= 70`, else `0` (full charge); reported as `(50,60)` / `(90,100)` |
+| Unsupported | neither present | The D-Bus call returns an error |
+
+```bash
+# Query current thresholds (shows the matching profile, if any)
+system76-power charge-thresholds
+
+# Apply a built-in profile
+system76-power charge-thresholds --profile max_lifespan
+system76-power charge-thresholds --profile balanced
+system76-power charge-thresholds --profile full_charge
+
+# Or set explicit start/end values
+system76-power charge-thresholds 50 60
+
+# List the built-in profiles
+system76-power charge-thresholds --list-profiles
+```
+
+Built-in profiles: `full_charge` (90–100%), `balanced` (86–90%), `max_lifespan`
+(50–60%).
 
 ---
 

@@ -28,8 +28,9 @@
 #   next AC power state change (plug/unplug). This allows you to override
 #   the automatic choice when needed.
 # - Auto-switching works in conjunction with display modes (see below)
-# - If display_modes is enabled, AC changes trigger display mode switching
-#   instead of profile switching (to avoid redundant refresh rate changes)
+# - An AC change is composite: if [display_modes] is enabled the display mode
+#   is applied first, and the profile switch (with its refresh rate change)
+#   still happens for the same event
 #
 enabled = true
 
@@ -41,8 +42,9 @@ enabled = true
 [refresh_rate]
 # Automatically adjust display refresh rate based on POWER PROFILE
 #
-# TRIGGER: Changes when you manually switch power profiles or when auto_switch
-#          changes profiles (only if display_modes is disabled)
+# TRIGGER: Changes on every profile change — manual switches and auto_switch
+#          events alike (a manual switch still changes the refresh rate even
+#          when display_modes is enabled)
 #
 # When enabled:
 #   - Battery profile     → 60Hz (saves ~3-4W of display power)
@@ -51,6 +53,9 @@ enabled = true
 #
 # When disabled:
 #   - Display refresh rate remains at user-configured setting
+#
+# Only the active resolution is used: a refresh rate change never alters the
+# display resolution (the built-in display's current mode is kept).
 #
 # Default: enabled = true
 #
@@ -162,6 +167,89 @@ battery_refresh_rate = 60
 
 
 ################################################################################
+# DEVICE POWER POLICIES
+################################################################################
+#
+# Every key below is optional; omitting a key (or the whole section) keeps the
+# built-in default shown after "Default:".
+#
+# These policies are applied every time a power profile is selected.
+
+[profile]
+# Dim the screen and turn off the keyboard backlight when the BATTERY profile
+# is applied. Opt-in: the other profiles never touch your brightness.
+# Default: false
+dim_on_battery = false
+
+
+[usb]
+# Autosuspend USB devices on battery/balanced (skipping the blacklists below);
+# the performance profile always sets `on` (no autosuspend).
+# Default: true
+autosuspend = true
+
+# Interface drivers that must never be autosuspended (space-separated).
+# Default: usblp
+blacklist_drivers = "usblp"
+
+# Devices that must never be autosuspended, as lowercase `vid:pid`
+# (space-separated).
+# Default: (empty)
+blacklist = ""
+
+
+[audio]
+# HDA power-save: enabled on battery/balanced, cleared for performance.
+# Default: true
+power_save = true
+
+
+[wifi]
+# Wi-Fi power-save via `iw`: on for battery, off for balanced/performance.
+# Default: true
+power_save = true
+
+
+[pci]
+# PCI runtime power management: off for performance, on for battery/balanced
+# (skipping devices whose driver is listed below).
+# Default: true
+runtime_pm = true
+
+# Drivers left out of runtime PM (space-separated).
+# Default: amdgpu nvidia nouveau radeon
+blacklist_drivers = "amdgpu nvidia nouveau radeon"
+
+
+[radio]
+# Soft-block Bluetooth while the battery profile is active. The daemon only
+# ever blocks — it never unblocks, so a Bluetooth you turned off manually
+# stays off.
+# Default: false
+bluetooth_off_on_battery = false
+
+
+[cpu]
+# AMD SMU power limits in milliwatts, applied through `ryzenadj` (best effort:
+# a missing/unsupported `ryzenadj` only logs a warning). The values below suit
+# an HX-class package (55W sustained) — scale them down for U-series parts.
+# Defaults: battery 12W/18W/10W @60°C, AC 55W/80W/80W @95°C
+battery_stapm_mw = 12000
+battery_fast_mw = 18000
+battery_slow_mw = 10000
+battery_tctl_c = 60
+ac_stapm_mw = 55000
+ac_fast_mw = 80000
+ac_slow_mw = 80000
+ac_tctl_c = 95
+
+# `energy_performance_preference` for the battery profile on `amd-pstate-epp`.
+# Ignored (falls back to `balance_power`) when the CPU does not advertise it.
+# Default: power
+battery_epp = "power"
+
+
+################################################################################
 # TROUBLESHOOTING & DIAGNOSTICS
 ################################################################################
 #
@@ -184,6 +272,23 @@ battery_refresh_rate = 60
 #   system76-power profile performance
 #   system76-power profile balanced
 #   system76-power profile battery
+#
+# AUDITING THE APPLIED SETTINGS:
+#   system76-power doctor
+#     Reports every configured knob as OK / DRIFT / SKIP against the active
+#     profile (read-only, no root, works while the daemon is stopped; exit
+#     code 1 when something drifted).
+#
+# CHECKING CHARGE THRESHOLDS:
+#   system76-power charge-thresholds
+#   system76-power charge-thresholds --profile max_lifespan
+#   system76-power charge-thresholds 50 60
+#     Works with the generic `charge_control_*` sysfs pair or Lenovo
+#     `conservation_mode` (1 = ~60%, 0 = full charge).
+#
+# RELOADING THE CONFIGURATION:
+#   sudo kill -HUP $(pidof system76-power)
+#     Re-reads /etc/system76-power.conf and re-applies the active profile.
 #
 # MANUAL REFRESH RATE CHANGE:
 #   GNOME Wayland:
@@ -216,9 +321,11 @@ battery_refresh_rate = 60
 #    - Check logs for "Auto-switching is enabled" message
 #
 # 5. Changes not taking effect:
-#    - Config file changes are loaded on daemon startup
+#    - Reload without restarting: sudo kill -HUP $(pidof system76-power)
+#    - Config file changes are also read on daemon startup
 #    - Restart daemon: sudo systemctl restart com.system76.PowerDaemon
 #    - Check file permissions: should be readable by system76-power user
+#    - Run `system76-power doctor` to see which knob drifted
 #
 ################################################################################
 # POWER SAVINGS REFERENCE
