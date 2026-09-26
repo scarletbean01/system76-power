@@ -559,7 +559,7 @@ mod tests {
         assert!(config.auto_switch);
         assert!(config.refresh_rate.enabled);
         assert_eq!(config.refresh_rate.battery, 60);
-        assert_eq!(config.refresh_rate.balanced, 60);
+        assert_eq!(config.refresh_rate.balanced, 240);
         assert_eq!(config.refresh_rate.performance, 240);
         assert_eq!(
             config.display_modes.ac_mode,
