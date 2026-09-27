@@ -273,7 +273,9 @@ pub(crate) fn write_vendor_config(vendor: GraphicsMode) -> Result<(), GraphicsDe
     };
 
     for service in &["nvidia-powerd.service"] {
-        let status = systemd::systemctl(&[service, action])
+        // Arguments are `[action, service]`: systemctl's verb must come first,
+        // otherwise it exits with "Unknown command verb 'nvidia-powerd.service'".
+        let status = systemd::systemctl(&[action, service])
             .map_err(|why| GraphicsDeviceError::Command { cmd: systemd::SYSTEMCTL_CMD, why })?;
 
         if status.success() {
