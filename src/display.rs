@@ -39,6 +39,7 @@ const SESSION_ENV_VARS: &[&str] = &[
     "DBUS_SESSION_BUS_ADDRESS",
     "WAYLAND_SOCKET",
     "QT_QPA_PLATFORM",
+    "HYPRLAND_INSTANCE_SIGNATURE",
 ];
 
 /// Represents a display mode with resolution and refresh rate
@@ -61,6 +62,7 @@ pub struct DisplayMode {
 pub enum DisplayServer {
     GnomeWayland,
     KdeWayland,
+    Hyprland,
     Wayland,
     X11,
     Unknown,
@@ -102,6 +104,14 @@ fn detect_from_env() -> Option<DisplayServer> {
     {
         log::debug!("Detected KDE Wayland from process environment");
         return Some(DisplayServer::KdeWayland);
+    }
+
+    // Check for Hyprland specifically
+    if session_type.as_deref() == Some("wayland")
+        && current_desktop.as_ref().map(|d| d.contains("Hyprland")).unwrap_or(false)
+    {
+        log::debug!("Detected Hyprland from process environment");
+        return Some(DisplayServer::Hyprland);
     }
 
     // Check for other Wayland compositors
@@ -186,6 +196,14 @@ fn detect_server_from_env_vars(env_vars: &[(String, String)]) -> Option<DisplayS
     {
         log::debug!("Detected KDE Wayland");
         return Some(DisplayServer::KdeWayland);
+    }
+
+    // Check for Hyprland specifically
+    if session_type.as_deref() == Some("wayland")
+        && current_desktop.as_ref().map(|d| d.contains("Hyprland")).unwrap_or(false)
+    {
+        log::debug!("Detected Hyprland");
+        return Some(DisplayServer::Hyprland);
     }
 
     // Check for other Wayland compositors
@@ -496,7 +514,7 @@ fn get_user_session_env(user: &str) -> Result<Vec<(String, String)>, io::Error> 
         let env_vars = read_process_environment(&pid)?;
 
         if !env_vars.is_empty() {
-            return Ok(env_vars);
+            return Ok(with_hyprland_signature(user, env_vars));
         }
 
         log::warn!("Compositor PID {} had no display environment, trying fallback", pid);
@@ -514,7 +532,99 @@ fn get_user_session_env(user: &str) -> Result<Vec<(String, String)>, io::Error> 
         ));
     }
 
-    Ok(env_vars)
+    Ok(with_hyprland_signature(user, env_vars))
+}
+
+/// Ensure the environment carries `HYPRLAND_INSTANCE_SIGNATURE` when the
+/// session runs Hyprland.
+///
+/// `hyprctl` locates its IPC socket via `HYPRLAND_INSTANCE_SIGNATURE`, but the
+/// compositor's own environment (the process we read env vars from) never sets
+/// that variable — it is only exported to Hyprland's children.
+fn with_hyprland_signature(
+    user: &str,
+    mut env_vars: Vec<(String, String)>,
+) -> Vec<(String, String)> {
+    let is_hyprland =
+        env_vars.iter().any(|(k, v)| k == "XDG_CURRENT_DESKTOP" && v.contains("Hyprland"));
+
+    if !is_hyprland || env_vars.iter().any(|(k, _)| k == "HYPRLAND_INSTANCE_SIGNATURE") {
+        return env_vars;
+    }
+
+    // Compute before pushing: `discover` borrows `env_vars` for the sudo env.
+    let signature = discover_hyprland_signature(user, &env_vars);
+
+    if let Some(sig) = signature {
+        log::debug!("Discovered HYPRLAND_INSTANCE_SIGNATURE: {}", sig);
+        env_vars.push(("HYPRLAND_INSTANCE_SIGNATURE".to_string(), sig));
+    }
+
+    env_vars
+}
+
+/// Find the signature of the active Hyprland instance for `user`.
+///
+/// Asks `hyprctl instances -j`, which works without `HYPRLAND_INSTANCE_SIGNATURE`
+/// set, and picks the instance whose PID matches the user's compositor process.
+/// Falls back to the single instance directory under `/run/user/<uid>/hypr/`
+/// when `hyprctl` is unavailable; stale directories from crashed sessions rule
+/// that fallback out, so it is only a last resort.
+fn discover_hyprland_signature(user: &str, env_vars: &[(String, String)]) -> Option<String> {
+    let ctx = SessionContext { user: user.to_string(), env_vars: env_vars.to_vec() };
+
+    if let Ok(output) = run_command_as_user(&ctx, "hyprctl", &["instances", "-j"]) {
+        if output.status.success() {
+            match serde_json::from_slice::<Vec<serde_json::Value>>(&output.stdout) {
+                Ok(instances) => {
+                    if instances.len() == 1 {
+                        if let Some(sig) = instances[0]["instance"].as_str() {
+                            return Some(sig.to_string());
+                        }
+                    }
+
+                    // Multiple instances (e.g. one left over from a crashed
+                    // session): identify ours by the compositor PID.
+                    let compositor_pid =
+                        find_compositor_pid(user).and_then(|pid| pid.parse::<u64>().ok());
+
+                    if let Some(pid) = compositor_pid {
+                        if let Some(sig) = instances
+                            .iter()
+                            .find(|i| i["pid"].as_u64() == Some(pid))
+                            .and_then(|i| i["instance"].as_str())
+                        {
+                            return Some(sig.to_string());
+                        }
+                    }
+
+                    log::debug!(
+                        "Found {} Hyprland instances, none matched our compositor",
+                        instances.len()
+                    );
+                }
+                Err(e) => log::debug!("Failed to parse 'hyprctl instances -j': {}", e),
+            }
+        } else {
+            log::debug!("hyprctl instances failed: {}", hyprctl_error_text(&output));
+        }
+    }
+
+    let output = Command::new("id").arg("-u").arg(user).output().ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let uid = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let mut entries = std::fs::read_dir(format!("/run/user/{}/hypr", uid))
+        .ok()?
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+        .map(|e| e.file_name().to_string_lossy().into_owned());
+
+    let first = entries.next()?;
+    (entries.next().is_none()).then_some(first)
 }
 
 /// Get session context (user + environment) - call this once and pass it around
@@ -931,6 +1041,249 @@ impl DisplayManager for KdeManager<'_> {
     }
 }
 
+/// Hyprland Wayland backend — uses `hyprctl`
+///
+/// Queries `hyprctl monitors all -j` (JSON) for the built-in display's modes and
+/// applies modes via the `hl.monitor` Lua API, rebuilding the full monitor
+/// rule from the current position and scale so only the refresh rate changes.
+struct HyprlandManager<'a> {
+    ctx: &'a SessionContext,
+}
+
+/// Extract the diagnostic text from a failed `hyprctl` invocation.
+///
+/// `hyprctl` prints errors (`HYPRLAND_INSTANCE_SIGNATURE not set!`, Lua errors, …)
+/// to **stdout** and leaves stderr empty, so `stderr` alone loses the message.
+fn hyprctl_error_text(output: &std::process::Output) -> String {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if !stderr.trim().is_empty() {
+        return stderr.into_owned();
+    }
+
+    String::from_utf8_lossy(&output.stdout).trim().to_string()
+}
+
+/// Run `hyprctl monitors all -j` and parse the JSON array.
+fn hyprctl_monitors(ctx: &SessionContext) -> Result<Vec<serde_json::Value>, DisplayError> {
+    let output = run_command_as_user(ctx, "hyprctl", &["monitors", "all", "-j"])?;
+
+    if !output.status.success() {
+        return Err(DisplayError::CommandFailed {
+            command: "hyprctl monitors all -j".to_string(),
+            stderr: hyprctl_error_text(&output),
+        });
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    serde_json::from_str(&stdout).map_err(|e| DisplayError::CommandFailed {
+        command: "hyprctl monitors all -j (parse)".to_string(),
+        stderr: format!("invalid JSON: {}", e),
+    })
+}
+
+/// Parse an `availableModes` string like "2560x1600@240.00Hz" into a DisplayMode.
+fn parse_hyprland_mode(mode_str: &str) -> Option<DisplayMode> {
+    let spec = mode_str.strip_suffix("Hz")?;
+    let (resolution_str, rate_str) = spec.split_once('@')?;
+    let (width_str, height_str) = resolution_str.split_once('x')?;
+
+    Some(DisplayMode {
+        // Canonical form without the "Hz" suffix, matching the other backends.
+        mode_string: spec.to_string(),
+        resolution: (width_str.parse().ok()?, height_str.parse().ok()?),
+        refresh_rate: rate_str.parse().ok()?,
+        has_vrr: false,
+        is_current: false,
+    })
+}
+
+impl DisplayManager for HyprlandManager<'_> {
+    fn get_display_info(&self) -> Result<(String, Vec<DisplayMode>), DisplayError> {
+        log::debug!("Querying hyprctl for display info (name + modes)");
+
+        let monitors = hyprctl_monitors(self.ctx)?;
+
+        // Prefer the built-in display, fall back to the first monitor.
+        let monitor = monitors
+            .iter()
+            .find(|m| {
+                m["name"]
+                    .as_str()
+                    .map(|n| n.starts_with("eDP") || n.starts_with("LVDS"))
+                    .unwrap_or(false)
+            })
+            .or_else(|| monitors.first())
+            .ok_or(DisplayError::SessionNotFound)?;
+
+        let display_name = monitor["name"].as_str().unwrap_or("eDP-1").to_string();
+
+        let current_res = (monitor["width"].as_u64(), monitor["height"].as_u64());
+        let current_rate = monitor["refreshRate"].as_f64();
+
+        let modes: Vec<DisplayMode> = monitor["availableModes"]
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str())
+                    .filter_map(|s| {
+                        let mode = parse_hyprland_mode(s)?;
+                        let is_current = current_res
+                            == (Some(mode.resolution.0 as u64), Some(mode.resolution.1 as u64))
+                            && current_rate
+                                .map(|r| (r - mode.refresh_rate as f64).abs() < 1.0)
+                                .unwrap_or(false);
+                        Some(DisplayMode { is_current, ..mode })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        log::info!("Found {} available modes for display '{}'", modes.len(), display_name);
+
+        ensure_modes_found(
+            &modes,
+            &display_name,
+            "hyprctl",
+            &serde_json::to_string(&monitor).unwrap_or_default(),
+        )?;
+
+        Ok((display_name, modes))
+    }
+
+    fn apply_mode(&self, display_name: &str, mode: &DisplayMode) -> Result<(), DisplayError> {
+        // Re-query to rebuild the full monitor rule, preserving position and scale.
+        let monitors = hyprctl_monitors(self.ctx)?;
+        let monitor = monitors
+            .iter()
+            .find(|m| m["name"].as_str() == Some(display_name))
+            .ok_or_else(|| DisplayError::CommandFailed {
+                command: "hyprctl monitors all -j".to_string(),
+                stderr: format!("monitor '{}' not found", display_name),
+            })?;
+
+        let x = monitor["x"].as_i64().unwrap_or(0);
+        let y = monitor["y"].as_i64().unwrap_or(0);
+        let scale = monitor["scale"].as_f64().unwrap_or(1.0);
+
+        // Canonical Hyprland mode token; the reported "2560x1600@240.00Hz" form is
+        // also accepted, but "Hz" is not part of the documented monitor-rule syntax.
+        let mode_arg = mode.mode_string.trim_end_matches("Hz");
+
+        // Hyprland >= 0.50 uses a non-legacy config parser: `hyprctl keyword`
+        // rejects keywords (exit 0, no effect) and config changes must go through
+        // the Lua API. Legacy parsers make `eval` fail, so fall back to `keyword`.
+        let lua = format!(
+            "hl.monitor({{ output = \"{}\", mode = \"{}\", position = \"{}x{}\", scale = {} }})",
+            display_name,
+            mode_arg,
+            x,
+            y,
+            format_scale(scale)
+        );
+
+        log::debug!("Executing: sudo -u {} env [vars...] hyprctl eval '{}'", self.ctx.user, lua);
+
+        // Keep every attempt's diagnostic so a failed verification can explain itself.
+        let mut attempt_errors = String::new();
+
+        let eval_output = run_command_as_user(self.ctx, "hyprctl", &["eval", &lua])?;
+
+        if !eval_output.status.success() {
+            let eval_error = hyprctl_error_text(&eval_output);
+            log::debug!("hyprctl eval failed ({}), falling back to keyword monitor", eval_error);
+            attempt_errors.push_str(&format!("eval: {}; ", eval_error));
+
+            let rule = format!("{},{},{}x{},{}", display_name, mode_arg, x, y, format_scale(scale));
+            let keyword_output =
+                run_command_as_user(self.ctx, "hyprctl", &["keyword", "monitor", &rule])?;
+
+            if !keyword_output.status.success() {
+                attempt_errors
+                    .push_str(&format!("keyword: {}", hyprctl_error_text(&keyword_output)));
+                log::error!("hyprctl apply failed: {}", attempt_errors);
+                return Err(DisplayError::CommandFailed {
+                    command: "hyprctl eval hl.monitor".to_string(),
+                    stderr: attempt_errors,
+                });
+            }
+        }
+
+        // `hyprctl` exits 0 even when it rejects a rule, so confirm the mode
+        // actually took effect before reporting success.
+        match verify_applied_mode(self.ctx, display_name, mode) {
+            Ok(()) => {}
+            Err(DisplayError::CommandFailed { stderr, .. }) => {
+                let stderr = format!("{}{}", attempt_errors, stderr);
+                log::error!("=== Display Refresh Rate Change: FAILED - {} ===", stderr);
+                return Err(DisplayError::CommandFailed {
+                    command: "hyprctl monitor mode verification".to_string(),
+                    stderr,
+                });
+            }
+            Err(e) => return Err(e),
+        }
+        log::info!("Successfully applied mode {} to {}", mode.mode_string, display_name);
+
+        Ok(())
+    }
+}
+
+/// Verify the requested mode was actually applied.
+///
+/// `hyprctl` exits 0 even when it rejects a monitor rule, so a successful exit
+/// status proves nothing. Re-query the monitor and compare the active
+/// resolution and refresh rate against the requested mode.
+fn verify_applied_mode(
+    ctx: &SessionContext,
+    display_name: &str,
+    mode: &DisplayMode,
+) -> Result<(), DisplayError> {
+    let monitors = hyprctl_monitors(ctx)?;
+    let monitor =
+        monitors.iter().find(|m| m["name"].as_str() == Some(display_name)).ok_or_else(|| {
+            DisplayError::CommandFailed {
+                command: "hyprctl monitors all -j".to_string(),
+                stderr: format!("monitor '{}' not found after applying mode", display_name),
+            }
+        })?;
+
+    let width = monitor["width"].as_u64();
+    let height = monitor["height"].as_u64();
+    let rate = monitor["refreshRate"].as_f64();
+
+    let resolution_matches =
+        width == Some(mode.resolution.0 as u64) && height == Some(mode.resolution.1 as u64);
+    let rate_matches = rate.map(|r| (r - mode.refresh_rate as f64).abs() < 1.0).unwrap_or(false);
+
+    if resolution_matches && rate_matches {
+        return Ok(());
+    }
+
+    Err(DisplayError::CommandFailed {
+        command: "hyprctl monitor mode verification".to_string(),
+        stderr: format!(
+            "requested {}x{}@{:.2}Hz but display reports {}x{}@{:.2}Hz",
+            mode.resolution.0,
+            mode.resolution.1,
+            mode.refresh_rate,
+            width.unwrap_or(0),
+            height.unwrap_or(0),
+            rate.unwrap_or(0.0)
+        ),
+    })
+}
+
+/// Format a Hyprland scale without a trailing ".0" (Hyprland expects e.g. "1.6" or "1").
+fn format_scale(scale: f64) -> String {
+    if (scale - scale.round()).abs() < f64::EPSILON {
+        format!("{}", scale.round() as i64)
+    } else {
+        let formatted = format!("{:.6}", scale);
+        formatted.trim_end_matches('0').trim_end_matches('.').to_string()
+    }
+}
+
 /// Construct the correct `DisplayManager` for the active session.
 ///
 /// Returns an error for unsupported display servers (generic Wayland, Unknown).
@@ -948,6 +1301,10 @@ fn create_manager(ctx: &SessionContext) -> Result<Box<dyn DisplayManager + '_>, 
         DisplayServer::KdeWayland => {
             log::info!("Using KDE Wayland backend (kscreen-doctor)");
             Ok(Box::new(KdeManager { ctx }))
+        }
+        DisplayServer::Hyprland => {
+            log::info!("Using Hyprland backend (hyprctl)");
+            Ok(Box::new(HyprlandManager { ctx }))
         }
         DisplayServer::X11 => {
             log::info!("Using X11 backend (xrandr)");
@@ -1324,6 +1681,11 @@ fn select_best_mode(
 ) -> Result<DisplayMode, io::Error> {
     match mode_spec {
         ModeSpec::ModeString(mode_str) => {
+            // Accept the "…Hz" suffix that `hyprctl monitors` prints, so specs
+            // copied from it (or from `system76-power.conf` examples) still match
+            // the canonical, suffix-free mode strings we store.
+            let mode_str = mode_str.trim_end_matches("Hz").trim_end_matches("hz");
+
             // Try exact mode string match first
             if let Some(mode) = available_modes.iter().find(|m| m.mode_string == *mode_str) {
                 return Ok(mode.clone());
@@ -1522,5 +1884,64 @@ mod tests {
 
         assert_eq!(candidates.len(), 2);
         assert_eq!(best.resolution, (2560, 1440));
+    }
+
+    /// `hyprctl` reports modes as "2560x1600@240.00Hz"; the stored mode string must
+    /// be the canonical, suffix-free form used to build monitor rules.
+    #[test]
+    fn test_parse_hyprland_mode() {
+        let mode = parse_hyprland_mode("2560x1600@240.00Hz").expect("valid mode");
+        assert_eq!(mode.resolution, (2560, 1600));
+        assert_eq!(mode.refresh_rate, 240.0);
+        assert_eq!(mode.mode_string, "2560x1600@240.00");
+        assert!(!mode.is_current);
+
+        assert!(parse_hyprland_mode("2560x1600@240.00").is_none(), "missing Hz suffix");
+        assert!(parse_hyprland_mode("garbage").is_none());
+    }
+
+    #[test]
+    fn test_format_scale() {
+        assert_eq!(format_scale(1.6), "1.6");
+        assert_eq!(format_scale(1.0), "1");
+        assert_eq!(format_scale(2.0), "2");
+        assert_eq!(format_scale(1.0 / 3.0), "0.333333");
+    }
+
+    /// Specs copied from `hyprctl monitors` output carry a "Hz" suffix that our
+    /// stored mode strings do not; such specs must still resolve to the mode.
+    #[test]
+    fn test_select_best_mode_accepts_hz_suffix() {
+        let modes = vec![mode(2560, 1600, 240.0, true), mode(2560, 1600, 60.0, false)];
+
+        for spec in ["2560x1600@240.00Hz", "2560x1600@240", "2560x1600@240.00"] {
+            let best = select_best_mode(
+                &modes,
+                &ModeSpec::ModeString(spec.to_string()),
+                "eDP-1",
+                false,
+            )
+            .unwrap_or_else(|e| panic!("spec '{}' must resolve: {}", spec, e));
+
+            assert_eq!(best.refresh_rate, 240.0, "spec '{}'", spec);
+        }
+    }
+
+    /// `hyprctl` reports errors on stdout; the message must not be lost.
+    #[test]
+    fn test_hyprctl_error_text_falls_back_to_stdout() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let failed = |stdout: &str, stderr: &str| std::process::Output {
+            status: std::process::ExitStatus::from_raw(1 << 8),
+            stdout: stdout.as_bytes().to_vec(),
+            stderr: stderr.as_bytes().to_vec(),
+        };
+
+        assert_eq!(
+            hyprctl_error_text(&failed("HYPRLAND_INSTANCE_SIGNATURE not set!", "")),
+            "HYPRLAND_INSTANCE_SIGNATURE not set!"
+        );
+        assert_eq!(hyprctl_error_text(&failed("ignored", "real error")), "real error");
     }
 }
