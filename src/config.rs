@@ -189,6 +189,24 @@ impl Default for CpuConfig {
     }
 }
 
+/// Display manager restart policy during runtime graphics switching.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RuntimeRestartDm {
+    /// Always restart display manager on live switch if active.
+    #[default]
+    Always,
+    /// Automatically skip restarting display manager if teardown is not needed and target is not discrete.
+    Auto,
+    /// Never restart display manager on live switch.
+    Never,
+}
+
+/// Runtime graphics switching policy.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct GraphicsConfig {
+    pub runtime_restart_dm: RuntimeRestartDm,
+}
+
 /// The complete daemon configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
@@ -202,6 +220,7 @@ pub struct Config {
     pub pci:           PciConfig,
     pub radio:         RadioConfig,
     pub cpu:           CpuConfig,
+    pub graphics:      GraphicsConfig,
 }
 
 // `Default` must not be derived for `Config` because `auto_switch` defaults to
@@ -221,6 +240,7 @@ impl Default for Config {
             pci:           PciConfig::default(),
             radio:         RadioConfig::default(),
             cpu:           CpuConfig::default(),
+            graphics:      GraphicsConfig::default(),
         }
     }
 }
@@ -414,6 +434,15 @@ fn apply(config: &mut Config, section: &str, key: &str, value: &str) -> bool {
             "ac_slow_mw" => set_u32(&mut config.cpu.ac_slow_mw, value, section, key),
             "ac_tctl_c" => set_u32(&mut config.cpu.ac_tctl_c, value, section, key),
             "battery_epp" => config.cpu.battery_epp = value.to_string(),
+            _ => return false,
+        },
+        "graphics" => match key {
+            "runtime_restart_dm" => match value.to_ascii_lowercase().as_str() {
+                "always" => config.graphics.runtime_restart_dm = RuntimeRestartDm::Always,
+                "auto" => config.graphics.runtime_restart_dm = RuntimeRestartDm::Auto,
+                "never" => config.graphics.runtime_restart_dm = RuntimeRestartDm::Never,
+                _ => warn_invalid(section, key, value),
+            },
             _ => return false,
         },
         _ => return false,
@@ -628,5 +657,20 @@ mod tests {
         // A real trailing comment is still stripped.
         let config = parse("[refresh_rate]\nperformance = 240 # max\n");
         assert_eq!(config.refresh_rate.performance, 240);
+    }
+
+    #[test]
+    fn graphics_runtime_restart_dm_parsed() {
+        let config = parse("[graphics]\nruntime_restart_dm = auto\n");
+        assert_eq!(config.graphics.runtime_restart_dm, RuntimeRestartDm::Auto);
+
+        let config = parse("[graphics]\nruntime_restart_dm = never\n");
+        assert_eq!(config.graphics.runtime_restart_dm, RuntimeRestartDm::Never);
+
+        let config = parse("[graphics]\nruntime_restart_dm = always\n");
+        assert_eq!(config.graphics.runtime_restart_dm, RuntimeRestartDm::Always);
+
+        let config = parse("[graphics]\nruntime_restart_dm = invalid\n");
+        assert_eq!(config.graphics.runtime_restart_dm, RuntimeRestartDm::Always);
     }
 }

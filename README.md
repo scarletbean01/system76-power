@@ -151,39 +151,58 @@ Switch graphics modes **without rebooting** on supported hardware.
 # Switch to integrated graphics (no reboot required)
 sudo system76-power graphics runtime integrated
 
-# Switch to hybrid mode
-sudo system76-power graphics runtime hybrid
-
-# Switch to NVIDIA mode
-sudo system76-power graphics runtime nvidia
+# Switch to hybrid mode and wait for completion (including background initramfs)
+sudo system76-power graphics runtime hybrid --wait
 
 # Switch to compute mode
 sudo system76-power graphics runtime compute
+
+# Query status and stage of the most recent runtime switch
+system76-power graphics runtime --status
 ```
+
+### Options
+
+- `--wait`: Subscribes to D-Bus completion and failure signals (`GraphicsModeChanged`, `GraphicsSwitchFailed`, `GraphicsInitramfsDone`) and blocks until the switch and initramfs rebuild finish. Ideal for scripts, TTYs, or SSH sessions.
+- `--status`: Queries `/run/system76-power/graphics-switch.json` via D-Bus and displays the detailed report of the most recent switch (stage reached, success, rollback status, restarted DM).
 
 ### How It Works
 
-1. Stops display manager (GDM/SDDM/LightDM)
-2. Unbinds framebuffers and VT consoles
-3. Terminates processes using NVIDIA devices
-4. Unloads NVIDIA kernel modules
-5. Removes/rescans PCI devices
-6. Loads appropriate drivers for new mode
-7. Restarts display manager
+1. **Synchronous Validation & Planning**: The daemon validates the target mode, verifies hardware switchability, probes live driver and connector status, and evaluates the `[graphics] runtime_restart_dm` policy. Incompatible requests or no-ops (`from == to`) return immediately without touching hardware.
+2. **Concurrency Guard**: A mutual exclusion flag (`switch_in_progress`) prevents conflicting switches or runtime PM changes while a switch or initramfs rebuild is active.
+3. **Display Manager Management**: Managed through an RAII `DmGuard` that restores or restarts the detected display manager (GDM, SDDM, LightDM, greetd) on both success and error.
+4. **Framebuffer & Console Safety**: VT consoles are resolved dynamically; only NVIDIA-bound framebuffers are unbound, preserving iGPU text console output (TTYs) throughout the switch.
+5. **Driver Teardown & Bring-up**: Unloads or loads NVIDIA drivers, sets DRM modeset parameters (`nvidia-drm modeset=1`), loads `nvidia_uvm`, settles udev events, and polls for DRM card readiness.
+6. **Automatic Rollback**: If any intermediate stage fails, the daemon automatically reverts configuration files, unloads partially loaded modules, unbinds/removes discrete devices if needed, and starts the display manager.
+7. **Background Initramfs Rebuild**: After the live switch succeeds, the initramfs is rebuilt asynchronously in the background so that the next boot remains in sync.
+
+### Display Manager Restart Policy
+
+Configure how the display manager is handled in `/etc/system76-power.conf`:
+
+```ini
+[graphics]
+# Options: "always" (default), "auto", "never"
+runtime_restart_dm = "always"
+```
+
+- `always`: Stops and restarts the display manager on every runtime switch.
+- `auto`: Skips stopping/restarting the display manager when hardware teardown is not needed (e.g., Integrated → Hybrid on Wayland compositors with dynamic offload).
+- `never`: Never stops or restarts the display manager. Fails early with an error if active users or processes hold the GPU during required teardown.
+
+### Discrete Mode (Reboot Required)
+
+Runtime switching to `nvidia` (discrete) mode is not supported because Wayland compositors keep the boot GPU primary. To use discrete mode, run `sudo system76-power graphics nvidia` and reboot.
 
 ### D-Bus Interface
 
 ```
 Method: SetGraphicsRuntime(vendor: &str)
-Signal: GraphicsModeChanged — emitted when switch completes
-Signal: GraphicsInitramfsDone — emitted when background initramfs rebuild finishes
+Method: GetGraphicsSwitchStatus() -> (status: &str)
+Signal: GraphicsModeChanged(mode: &str) — emitted when live switch completes
+Signal: GraphicsSwitchFailed(target: &str, stage: &str, error: &str, rolled_back: bool)
+Signal: GraphicsInitramfsDone(mode: &str, success: bool)
 ```
-
-### Limitations
-
-- Some models with external displays connected to dGPU may not support switching away from NVIDIA mode
-- Active NVIDIA processes must be terminated for the switch to succeed
-- Wayland sessions handle the transition better than X11
 
 ---
 

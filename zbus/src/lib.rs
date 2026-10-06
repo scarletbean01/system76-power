@@ -51,6 +51,9 @@ trait PowerDaemon {
     /// GetDesktop method
     fn get_desktop(&self) -> zbus::Result<bool>;
 
+    /// GetGraphicsSwitchStatus method — returns JSON status of the last runtime switch
+    fn get_graphics_switch_status(&self) -> zbus::Result<String>;
+
     /// GetGraphicsPower method
     fn get_graphics_power(&self) -> zbus::Result<bool>;
 
@@ -80,6 +83,16 @@ trait PowerDaemon {
     /// GraphicsModeChanged signal — emitted when a runtime graphics switch completes
     #[dbus_proxy(signal)]
     fn graphics_mode_changed(&self, mode: &str) -> zbus::Result<()>;
+
+    /// GraphicsSwitchFailed signal — emitted when a runtime graphics switch fails
+    #[dbus_proxy(signal)]
+    fn graphics_switch_failed(
+        &self,
+        target: &str,
+        stage: &str,
+        error: &str,
+        rolled_back: bool,
+    ) -> zbus::Result<()>;
 
     /// GraphicsInitramfsDone signal — emitted when the background initramfs rebuild finishes
     #[dbus_proxy(signal)]

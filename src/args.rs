@@ -45,10 +45,23 @@ pub enum GraphicsArgs {
     )]
     Runtime {
         #[clap(
-            help = "Graphics mode to switch to",
+            help = "Graphics mode to switch to (required unless --status is specified)",
             value_parser = PossibleValuesParser::new(["integrated", "compute", "hybrid", "nvidia"]),
+            required_unless_present = "status",
         )]
-        mode: String,
+        mode: Option<String>,
+
+        #[clap(
+            long,
+            help = "Wait for the switch and background initramfs rebuild to complete before exiting"
+        )]
+        wait: bool,
+
+        #[clap(
+            long,
+            help = "Query the status of the most recent runtime graphics switch"
+        )]
+        status: bool,
     },
 }
 

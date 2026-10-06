@@ -108,17 +108,92 @@ this device is either a desktop or doesn't have both an iGPU and dGPU.
                 Some(GraphicsArgs::Nvidia) => {
                     client.set_graphics("nvidia").await.map_err(zbus_error)
                 }
-                Some(GraphicsArgs::Runtime { mode }) => {
-                    println!(
-                        "Switching to {} graphics at runtime (display manager will restart)...",
-                        mode
-                    );
-                    client.set_graphics_runtime(mode).await.map_err(zbus_error)?;
-                    println!("Done. Graphics mode is now {}.", mode);
-                    println!(
-                        "The initramfs is being rebuilt in the background for the next boot."
-                    );
-                    Ok(())
+                Some(GraphicsArgs::Runtime { mode, wait, status }) => {
+                    use futures_lite::StreamExt;
+
+                    if *status {
+                        let status_json =
+                            client.get_graphics_switch_status().await.map_err(zbus_error)?;
+                        if status_json.trim().is_empty() || status_json.trim() == "{}" {
+                            println!("No runtime graphics switch recorded.");
+                        } else {
+                            println!("{}", status_json);
+                        }
+                        return Ok(());
+                    }
+
+                    let Some(mode) = mode.as_deref() else {
+                        eprintln!(
+                            "Error: A graphics mode is required (or use --status to view last switch)"
+                        );
+                        std::process::exit(1);
+                    };
+
+                    if mode == "nvidia" {
+                        eprintln!(
+                            "Error: runtime switch to nvidia is not supported (Wayland compositors keep the boot GPU primary); run 'system76-power graphics nvidia' and reboot"
+                        );
+                        std::process::exit(1);
+                    }
+
+                    if *wait {
+                        println!(
+                            "Switching to {} graphics at runtime (display manager may restart)...",
+                            mode
+                        );
+                        let mut mode_changed =
+                            client.receive_graphics_mode_changed().await.map_err(zbus_error)?;
+                        let mut switch_failed =
+                            client.receive_graphics_switch_failed().await.map_err(zbus_error)?;
+                        let mut initramfs_done =
+                            client.receive_graphics_initramfs_done().await.map_err(zbus_error)?;
+
+                        client.set_graphics_runtime(mode).await.map_err(zbus_error)?;
+
+                        println!("Switch initiated. Waiting for completion...");
+
+                        tokio::select! {
+                            sig = mode_changed.next() => {
+                                if let Some(signal) = sig {
+                                    let new_mode = signal.args().map(|a| a.mode).unwrap_or(mode);
+                                    println!("Done. Live graphics switch to {} completed successfully.", new_mode);
+                                }
+                            }
+                            sig = switch_failed.next() => {
+                                if let Some(signal) = sig {
+                                    if let Ok(args) = signal.args() {
+                                        return Err(anyhow::anyhow!(
+                                            "Graphics switch to {} failed at stage '{}': {} (rolled back: {})",
+                                            args.target, args.stage, args.error, args.rolled_back
+                                        ));
+                                    } else {
+                                        return Err(anyhow::anyhow!("Graphics switch failed"));
+                                    }
+                                }
+                            }
+                        }
+
+                        println!("Waiting for background initramfs rebuild...");
+                        if let Some(signal) = initramfs_done.next().await {
+                            if let Ok(args) = signal.args() {
+                                if args.success {
+                                    println!("Initramfs rebuild completed successfully.");
+                                } else {
+                                    eprintln!("Warning: Background initramfs rebuild failed.");
+                                }
+                            }
+                        }
+                        Ok(())
+                    } else {
+                        println!(
+                            "Switching to {} graphics at runtime (display manager may restart)...",
+                            mode
+                        );
+                        client.set_graphics_runtime(mode).await.map_err(zbus_error)?;
+                        println!("Runtime graphics switch initiated in the background.");
+                        println!("Use 'system76-power graphics runtime --status' to monitor progress.");
+                        Ok(())
+                    }
                 }
                 Some(GraphicsArgs::Switchable) => client
                     .get_switchable()

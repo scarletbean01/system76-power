@@ -46,4 +46,23 @@ pub enum GraphicsDeviceError {
     UpdateInitramfs(ExitStatus),
     #[error("failed to access Xserver config: {}", _0)]
     XserverConf(io::Error),
+    #[error("runtime switch to {target} failed at {stage:?}: {why} (rolled back: {rolled_back})")]
+    RuntimeSwitch {
+        target: &'static str,
+        stage: super::transition::SwitchStage,
+        why: Box<GraphicsDeviceError>,
+        rolled_back: bool,
+    },
+    #[error("NVIDIA device {id} not found on PCI bus")]
+    DeviceNotFound { id: String },
+    #[error("NVIDIA DRM driver did not load with modeset=1")]
+    ModesetDisabled,
+    #[error("NVIDIA device is in use by processes: {pids:?}")]
+    DeviceBusy { pids: Vec<u32> },
+    #[error("cannot switch: display active on discrete GPU ({connector})")]
+    DgpuDisplayActive { connector: String },
+    #[error(
+        "runtime switch to nvidia is not supported (Wayland compositors keep the boot GPU primary); run `system76-power graphics nvidia` and reboot"
+    )]
+    RuntimeDiscreteUnsupported,
 }

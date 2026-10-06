@@ -7,10 +7,21 @@ use sysfs_class::{PciDevice, SysClass};
 
 use super::error::GraphicsDeviceError;
 
+#[derive(Clone)]
 pub struct GraphicsDevice {
     pub(super) id: String,
     devid: u16,
     functions: Vec<PciDevice>,
+}
+
+impl std::fmt::Debug for GraphicsDevice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GraphicsDevice")
+            .field("id", &self.id)
+            .field("devid", &self.devid)
+            .field("functions_count", &self.functions.len())
+            .finish()
+    }
 }
 
 impl GraphicsDevice {
@@ -27,6 +38,21 @@ impl GraphicsDevice {
     #[must_use]
     pub const fn device(&self) -> u16 {
         self.devid
+    }
+
+    #[must_use]
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    #[must_use]
+    pub fn functions(&self) -> &[PciDevice] {
+        &self.functions
+    }
+
+    #[must_use]
+    pub fn is_driver_bound(&self) -> bool {
+        self.functions.iter().any(|func| func.path().exists() && func.driver().is_ok())
     }
 
     pub unsafe fn unbind(&self) -> Result<(), GraphicsDeviceError> {

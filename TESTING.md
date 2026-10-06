@@ -102,3 +102,54 @@ Instructions for interacting with features for first-time testers.
     ```sh
     system76-power graphics power [ on | off]
     ```
+
+### Runtime Graphics Switching (No-Reboot)
+
+Tasks for verifying runtime (no-reboot) graphics switches on hardware.
+
+- [ ] **M1: Integrated → Hybrid (`runtime_restart_dm = "always"`)**
+    - [ ] Display manager restarts cleanly
+    - [ ] `nvidia_drm` loaded with `modeset=Y`
+    - [ ] `nvidia_uvm` loaded
+    - [ ] `power/control` settles to `auto` after 5 seconds
+    - [ ] PRIME offload works (`prime-run glxinfo` or `__NV_PRIME_RENDER_OFFLOAD=1`)
+    - [ ] Text consoles (Ctrl+Alt+F3) remain functional
+    - [ ] `GraphicsInitramfsDone(true)` emitted and status file updated
+- [ ] **M2: Integrated → Hybrid (`runtime_restart_dm = "auto"`, Wayland)**
+    - [ ] Display manager is NOT restarted; user desktop session survives intact
+    - [ ] NVIDIA card appears in `switcherooctl`
+- [ ] **M3: Integrated → Compute**
+    - [ ] `nvidia` loaded; `nvidia_drm` remains absent/blacklisted
+    - [ ] CUDA / compute workloads functional
+- [ ] **M4: Integrated → NVIDIA (runtime)**
+    - [ ] Rejected immediately with actionable reboot hint (`RuntimeDiscreteUnsupported`); no system state altered
+- [ ] **M5: Injected failure rollback**
+    - [ ] Injected failure during module load triggers automated rollback
+    - [ ] Display manager restarted/restored
+    - [ ] Config files and vendor mode reverted to previous mode
+    - [ ] `system76-power graphics runtime --status` reports failure stage and `rolled_back: true`
+- [ ] **M6: No-Change / Idempotency**
+    - [ ] Switching to the current mode (e.g. Integrated → Integrated) exits immediately without DM restart
+- [ ] **M7: No DM / Headless / TTY**
+    - [ ] Running runtime switch from TTY without an active DM succeeds without attempting to start GDM
+- [ ] **M8: Connected dGPU displays**
+    - [ ] Switching away from Hybrid with an active monitor on a dGPU port is rejected early
+- [ ] **M9: Stress Test**
+    - [ ] Toggling Integrated ↔ Hybrid 10 times consecutively produces no leaks, hangs, or kernel Xid errors
+- [ ] **M10: Suspend / Resume**
+    - [ ] System suspends and resumes properly after runtime switch
+- [ ] **M11: Concurrency Guard**
+    - [ ] Launching two concurrent `set_graphics_runtime` calls rejects the second with "Graphics switch in progress"
+- [ ] **M12: Boot consistency**
+    - [ ] Rebooting after runtime switch boots directly into the chosen mode
+
+### How To: Runtime Switching
+
+- Switch graphics mode and wait for completion:
+    ```sh
+    system76-power graphics runtime hybrid --wait
+    ```
+- Query last switch status:
+    ```sh
+    system76-power graphics runtime --status
+    ```

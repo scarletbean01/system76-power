@@ -9,11 +9,13 @@ mod mode;
 mod nvidia;
 mod runtime;
 mod systemd;
+pub(crate) mod transition;
 
 pub(crate) use config::update_initramfs_cmd;
 pub use device::GraphicsDevice;
 pub use error::GraphicsDeviceError;
 pub use mode::GraphicsMode;
+pub use transition::{RestartPolicy, SwitchReport, SwitchStage};
 
 use crate::{module::Module, pci::PciBus};
 use std::{fs, io};
@@ -29,6 +31,78 @@ pub struct Graphics {
     pub other: Vec<GraphicsDevice>,
 }
 
+type ProbedDevices = (
+    Vec<GraphicsDevice>,
+    Vec<GraphicsDevice>,
+    Vec<GraphicsDevice>,
+    Vec<GraphicsDevice>,
+);
+
+fn probe_devices() -> io::Result<ProbedDevices> {
+    let devs = PciDevice::all()?;
+
+    let functions = |parent: &PciDevice| -> Vec<PciDevice> {
+        let mut functions = Vec::new();
+        if let Some(parent_slot) = parent.id().split('.').next() {
+            for func in &devs {
+                if let Some(func_slot) = func.id().split('.').next() {
+                    if func_slot == parent_slot {
+                        log::info!("{}: Function for {}", func.id(), parent.id());
+                        functions.push(func.clone());
+                    }
+                }
+            }
+        }
+        functions
+    };
+
+    let mut amd = Vec::new();
+    let mut intel = Vec::new();
+    let mut nvidia = Vec::new();
+    let mut other = Vec::new();
+    for dev in &devs {
+        let c = dev.class()?;
+        if (c >> 16) & 0xFF == 0x03 {
+            match dev.vendor()? {
+                0x1002 => {
+                    log::info!("{}: AMD graphics", dev.id());
+                    amd.push(GraphicsDevice::new(
+                        dev.id().to_owned(),
+                        dev.device()?,
+                        functions(dev),
+                    ));
+                }
+                0x10DE => {
+                    log::info!("{}: NVIDIA graphics", dev.id());
+                    nvidia.push(GraphicsDevice::new(
+                        dev.id().to_owned(),
+                        dev.device()?,
+                        functions(dev),
+                    ));
+                }
+                0x8086 => {
+                    log::info!("{}: Intel graphics", dev.id());
+                    intel.push(GraphicsDevice::new(
+                        dev.id().to_owned(),
+                        dev.device()?,
+                        functions(dev),
+                    ));
+                }
+                vendor => {
+                    log::info!("{}: Other({:X}) graphics", dev.id(), vendor);
+                    other.push(GraphicsDevice::new(
+                        dev.id().to_owned(),
+                        dev.device()?,
+                        functions(dev),
+                    ));
+                }
+            }
+        }
+    }
+
+    Ok((amd, intel, nvidia, other))
+}
+
 impl Graphics {
     pub fn new() -> io::Result<Self> {
         let bus = PciBus::new()?;
@@ -36,68 +110,17 @@ impl Graphics {
         log::info!("Rescanning PCI bus");
         bus.rescan()?;
 
-        let devs = PciDevice::all()?;
-
-        let functions = |parent: &PciDevice| -> Vec<PciDevice> {
-            let mut functions = Vec::new();
-            if let Some(parent_slot) = parent.id().split('.').next() {
-                for func in &devs {
-                    if let Some(func_slot) = func.id().split('.').next() {
-                        if func_slot == parent_slot {
-                            log::info!("{}: Function for {}", func.id(), parent.id());
-                            functions.push(func.clone());
-                        }
-                    }
-                }
-            }
-            functions
-        };
-
-        let mut amd = Vec::new();
-        let mut intel = Vec::new();
-        let mut nvidia = Vec::new();
-        let mut other = Vec::new();
-        for dev in &devs {
-            let c = dev.class()?;
-            if (c >> 16) & 0xFF == 0x03 {
-                match dev.vendor()? {
-                    0x1002 => {
-                        log::info!("{}: AMD graphics", dev.id());
-                        amd.push(GraphicsDevice::new(
-                            dev.id().to_owned(),
-                            dev.device()?,
-                            functions(dev),
-                        ));
-                    }
-                    0x10DE => {
-                        log::info!("{}: NVIDIA graphics", dev.id());
-                        nvidia.push(GraphicsDevice::new(
-                            dev.id().to_owned(),
-                            dev.device()?,
-                            functions(dev),
-                        ));
-                    }
-                    0x8086 => {
-                        log::info!("{}: Intel graphics", dev.id());
-                        intel.push(GraphicsDevice::new(
-                            dev.id().to_owned(),
-                            dev.device()?,
-                            functions(dev),
-                        ));
-                    }
-                    vendor => {
-                        log::info!("{}: Other({:X}) graphics", dev.id(), vendor);
-                        other.push(GraphicsDevice::new(
-                            dev.id().to_owned(),
-                            dev.device()?,
-                            functions(dev),
-                        ));
-                    }
-                }
-            }
-        }
-
+        let (amd, intel, nvidia, other) = probe_devices()?;
         Ok(Self { bus, amd, intel, nvidia, other })
+    }
+
+    pub fn refresh_devices(&mut self) -> io::Result<()> {
+        let (amd, intel, nvidia, other) = probe_devices()?;
+        self.amd = amd;
+        self.intel = intel;
+        self.nvidia = nvidia;
+        self.other = other;
+        Ok(())
     }
 
     pub fn is_desktop(&self) -> bool {
@@ -115,8 +138,11 @@ impl Graphics {
 
     pub fn get_external_displays_require_dgpu(&self) -> Result<bool, GraphicsDeviceError> {
         self.switchable_or_fail()?;
-        let model = fs::read_to_string("/sys/class/dmi/id/product_version")
-            .map_err(GraphicsDeviceError::SysFs)?;
+        let model = match fs::read_to_string("/sys/class/dmi/id/product_version") {
+            Ok(m) => m,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(e) => return Err(GraphicsDeviceError::SysFs(e)),
+        };
         Ok(EXTERNAL_DISPLAY_REQUIRES_NVIDIA.contains(&model.trim()))
     }
 
@@ -199,134 +225,277 @@ impl Graphics {
 
     /// Switch graphics mode at runtime without a reboot.
     ///
-    /// Sequence:
-    ///   1.  Guard: external-display models that require the dGPU are rejected.
-    ///   2.  Stop the active display manager (gdm/sddm/lightdm).
-    ///   3.  Stop NVIDIA daemon services.
-    ///   4.  Unbind vtconsole framebuffer and EFI framebuffer (non-fatal).
-    ///   5.  Kill lingering `/dev/nvidia*` file-descriptor holders via `fuser -k`.
-    ///   6.  Unload NVIDIA kernel modules in reverse dependency order.
-    ///   7.  Unbind PCI functions from their kernel drivers (sysfs).
-    ///   8.  Remove PCI devices from the bus.
-    ///   9.  Write all configuration files (same as `set_vendor`, no initramfs).
-    ///  10.  (GPU-active modes only) Rescan PCI bus, load modules, start services.
-    ///  11.  Set sysfs power/control (5 s deferred — preserves the existing HACK).
-    ///  12.  Start the display manager again.
-    ///
-    /// The initramfs is NOT rebuilt here. The caller (daemon) schedules that as
-    /// an asynchronous background task so that the D-Bus call returns promptly.
-    ///
-    /// Returns the systemd unit name of the display manager that was restarted.
-    pub fn switch_runtime(&mut self, vendor: GraphicsMode) -> Result<String, GraphicsDeviceError> {
+    /// The switch is planned dynamically using live system state:
+    /// - From integrated: skips unnecessary driver teardown and display manager restart (when auto).
+    /// - Checks whether external displays or internal panels are currently active on the discrete GPU.
+    /// - Guarantees the display manager is always restored even on error or panic.
+    /// - Automatically rolls back configuration and device state if an intermediate step fails.
+    pub fn switch_runtime(&mut self, vendor: GraphicsMode) -> Result<SwitchReport, GraphicsDeviceError> {
+        let policy = crate::config::current().graphics.runtime_restart_dm;
+        self.switch_runtime_with_ops(&transition::RealOps, vendor, policy)
+    }
+
+    pub(crate) fn switch_runtime_with_ops<O: transition::SwitchOps>(
+        &mut self,
+        ops: &O,
+        target: GraphicsMode,
+        policy: RestartPolicy,
+    ) -> Result<SwitchReport, GraphicsDeviceError> {
         self.switchable_or_fail()?;
 
-        // Models where every external display routes through the dGPU cannot
-        // safely tear it down while a session may be active on those outputs.
-        if self.get_external_displays_require_dgpu()? {
-            log::warn!(
-                "runtime graphics switching is not supported on this model: \
-                 external displays require the dGPU"
-            );
-            return Err(GraphicsDeviceError::NotSwitchable);
-        }
+        let from = ops.get_vendor(self)?;
+        let live = ops.probe_live_state(self)?;
+        let external_displays_require_dgpu = self.get_external_displays_require_dgpu()?;
 
-        // ── Phase 1: Teardown ────────────────────────────────────────────────
-
-        let dm = runtime::detect_display_manager();
-        if let Some(dm) = dm {
-            log::info!("Stopping display manager: {}", dm);
-            let status = systemd::stop(dm).map_err(|why| {
-                GraphicsDeviceError::DisplayManagerStop { dm: dm.to_owned(), why }
-            })?;
-            if !status.success() {
-                return Err(GraphicsDeviceError::DisplayManagerStop {
-                    dm: dm.to_owned(),
-                    why: io::Error::new(
-                        io::ErrorKind::Other,
-                        format!("systemctl stop {} exited with {}", dm, status),
-                    ),
+        let plan = match transition::plan_transition(
+            from,
+            target,
+            &live,
+            policy,
+            external_displays_require_dgpu,
+        ) {
+            transition::PlanOutcome::NoChange => {
+                log::info!("Already in {:?} graphics mode with matching state", target);
+                return Ok(SwitchReport {
+                    from: from.into(),
+                    to: target.into(),
+                    dm_restarted: None,
+                    stage_reached: SwitchStage::Done,
+                    no_change: true,
                 });
             }
-            // Give systemd time to fully stop the DM and release DRM file descriptors.
-            std::thread::sleep(std::time::Duration::from_millis(2000));
-        }
+            transition::PlanOutcome::Rejected(err) => return Err(err),
+            transition::PlanOutcome::Plan(p) => p,
+        };
 
-        // Stop NVIDIA daemon services that hold /dev/nvidia* file descriptors.
-        runtime::stop_nvidia_services();
-
-        // Unbind the kernel framebuffer console from the GPU memory.
-        runtime::unbind_framebuffers();
-
-        // Forcefully close any remaining /dev/nvidia* file descriptors.
-        runtime::kill_nvidia_device_users();
-
-        // Unload in strict reverse dependency order. Treat "not loaded" as a
-        // non-error — only genuine failures (e.g. still in use) are propagated.
-        for module in &["nvidia-drm", "nvidia-modeset", "nvidia_uvm", "nvidia"] {
-            if let Err(why) = crate::modprobe::unload(module) {
-                log::warn!("Could not unload {}: {} (continuing)", module, why);
-            }
-        }
-
-        // Unbind PCI functions from their kernel drivers via sysfs.
-        unsafe {
-            for dev in &self.nvidia {
-                dev.unbind()?;
-            }
-        }
-
-        // Remove PCI devices from the bus (safe now that no driver is bound).
-        unsafe {
-            for dev in &self.nvidia {
-                dev.remove()?;
-            }
-        }
-
-        // ── Phase 2: Configuration (no initramfs rebuild) ────────────────────
-
-        config::write_vendor_config(vendor)?;
-
-        // ── Phase 3: Bring-up ────────────────────────────────────────────────
-
-        if vendor == GraphicsMode::Integrated {
-            // In integrated mode the NVIDIA GPU must remain removed from the PCI
-            // bus. Do NOT rescan — that would bring it back online. Do NOT load
-            // modules or start NVIDIA services.
-            log::info!("Integrated mode: skipping PCI rescan, module load, and NVIDIA services");
+        let dm_to_manage = if plan.restart_dm {
+            ops.detect_display_manager()
         } else {
-            // Refresh self from live PCI state. Graphics::new() already calls
-            // bus.rescan() internally, so we do not need a separate rescan call.
-            log::info!("Refreshing PCI device inventory");
-            *self = Graphics::new().map_err(GraphicsDeviceError::Rescan)?;
+            None
+        };
 
-            // Load the kernel modules required for the new mode.
-            runtime::load_modules_for_mode(vendor)?;
-
-            // Start NVIDIA daemon services that are enabled in systemd.
-            runtime::start_enabled_nvidia_services();
+        if dm_to_manage.is_none() && plan.teardown {
+            ops.stop_nvidia_services();
+            if let Err(why) = ops.check_device_users_idle(&self.nvidia) {
+                ops.start_enabled_nvidia_services();
+                return Err(why);
+            }
         }
 
-        // Set PCI power/control (5 s deferred thread — preserves the existing HACK).
-        if let Some(first) = self.nvidia.first() {
-            runtime::sysfs_power_control(first.id.clone(), vendor);
+        let mut dm_guard = runtime::DmGuard::new(dm_to_manage.clone());
+        let mut console_state = runtime::ConsoleState::default();
+        let mut current_stage = SwitchStage::Initial;
+
+        if let Some(ref dm) = dm_to_manage {
+            current_stage = SwitchStage::StopDm;
+            if let Err(why) = ops.stop_display_manager(dm) {
+                if let Some(dm_name) = dm_guard.unit() {
+                    let _ = ops.start_display_manager(dm_name);
+                    dm_guard.mark_restored();
+                }
+                return Err(GraphicsDeviceError::RuntimeSwitch {
+                    target: target.into(),
+                    stage: SwitchStage::StopDm,
+                    why: Box::new(why),
+                    rolled_back: false,
+                });
+            }
+            ops.sleep_ms(2000);
         }
 
-        // Start the display manager. A failure here is logged but not fatal —
-        // the GPU switch itself succeeded; the user can start the DM manually.
-        let dm_name = dm.unwrap_or("gdm");
-        log::info!("Starting display manager: {}", dm_name);
-        let status = systemd::start(dm_name).map_err(|why| {
-            GraphicsDeviceError::DisplayManagerStart { dm: dm_name.to_owned(), why }
-        })?;
-        if !status.success() {
-            log::warn!(
-                "systemctl start {} exited with {} — display may need manual restart",
-                dm_name,
-                status
-            );
+        let result = self.apply_plan(
+            ops,
+            plan,
+            target,
+            &mut current_stage,
+            &mut console_state,
+        );
+
+        match result {
+            Ok(()) => {
+                ops.rebind_framebuffers(&console_state);
+                let dm_restarted = if let Some(dm) = dm_guard.unit().map(|s| s.to_string()) {
+                    current_stage = SwitchStage::StartDm;
+                    let res = ops.start_display_manager(&dm);
+                    dm_guard.mark_restored();
+                    if res.is_ok() {
+                        Some(dm)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+
+                Ok(SwitchReport {
+                    from: from.into(),
+                    to: target.into(),
+                    dm_restarted,
+                    stage_reached: SwitchStage::Done,
+                    no_change: false,
+                })
+            }
+            Err(err) => {
+                log::error!("Runtime graphics switch failed at {:?}: {}", current_stage, err);
+                let rolled_back = self.rollback_with_ops(ops, from).is_ok();
+                ops.rebind_framebuffers(&console_state);
+                if let Some(dm) = dm_guard.unit().map(|s| s.to_string()) {
+                    let _ = ops.start_display_manager(&dm);
+                    dm_guard.mark_restored();
+                }
+                Err(GraphicsDeviceError::RuntimeSwitch {
+                    target: target.into(),
+                    stage: current_stage,
+                    why: Box::new(err),
+                    rolled_back,
+                })
+            }
+        }
+    }
+
+    fn apply_plan<O: transition::SwitchOps>(
+        &mut self,
+        ops: &O,
+        plan: transition::TransitionPlan,
+        target: GraphicsMode,
+        stage: &mut SwitchStage,
+        console_state: &mut runtime::ConsoleState,
+    ) -> Result<(), GraphicsDeviceError> {
+        // Phase 1: Teardown
+        if plan.teardown {
+            *stage = SwitchStage::Teardown;
+            ops.stop_nvidia_services();
+            *console_state = ops.unbind_framebuffers(&self.nvidia)?;
+            ops.kill_nvidia_device_users();
+
+            for module in &["nvidia-drm", "nvidia-modeset", "nvidia_uvm", "nvidia"] {
+                if let Err(why) = ops.unload_module(module) {
+                    log::warn!("Could not unload {}: {} (continuing)", module, why);
+                }
+            }
+
+            for dev in &self.nvidia {
+                ops.unbind_device(dev)?;
+            }
+
+            for dev in &self.nvidia {
+                ops.remove_device(dev)?;
+            }
         }
 
-        Ok(dm_name.to_owned())
+        // Phase 2: Configuration
+        *stage = SwitchStage::WriteConfig;
+        ops.write_vendor_config(target)?;
+
+        // Phase 3: Bring-up
+        if plan.bring_up {
+            *stage = SwitchStage::Rescan;
+            let target_pci_id = self.nvidia.first().map(|d| d.id.clone());
+            ops.rescan_pci()?;
+            let _ = ops.udev_settle();
+
+            if let Some(ref pci_id) = target_pci_id {
+                let found = ops.wait_for_device(pci_id, 5000)?;
+                if !found {
+                    return Err(GraphicsDeviceError::DeviceNotFound { id: pci_id.clone() });
+                }
+            }
+
+            // Refresh device inventory
+            let old_nvidia = self.nvidia.clone();
+            ops.refresh_inventory(self)?;
+
+            if self.nvidia.is_empty() {
+                self.nvidia = old_nvidia;
+                let missing_id = target_pci_id.unwrap_or_else(|| "0000:01:00.0".to_string());
+                return Err(GraphicsDeviceError::DeviceNotFound { id: missing_id });
+            }
+
+            let first_pci = self.nvidia.first().map(|d| d.id.clone());
+
+            *stage = SwitchStage::LoadModules;
+            ops.load_modules_for_mode(target)?;
+
+            if target == GraphicsMode::Hybrid || target == GraphicsMode::Discrete {
+                let modeset_ok = ops.verify_modeset()?;
+                if !modeset_ok {
+                    log::warn!("nvidia-drm modeset not active, attempting reload");
+                    let _ = ops.unload_module("nvidia-drm");
+                    ops.load_module("nvidia-drm", &["modeset=1"])?;
+                    if !ops.verify_modeset()? {
+                        return Err(GraphicsDeviceError::ModesetDisabled);
+                    }
+                }
+
+                if let Some(ref pci_id) = first_pci {
+                    let _ = ops.wait_for_drm_card(pci_id, 5000);
+                }
+            }
+
+            *stage = SwitchStage::StartServices;
+            ops.start_enabled_nvidia_services();
+
+            if let Some(pci_id) = first_pci {
+                ops.sysfs_power_control(pci_id, target);
+            }
+        }
+
+        Ok(())
+    }
+
+    fn rollback_with_ops<O: transition::SwitchOps>(
+        &mut self,
+        ops: &O,
+        prev: GraphicsMode,
+    ) -> Result<(), GraphicsDeviceError> {
+        log::warn!("Rolling back graphics state to {:?}", prev);
+        let mut success = true;
+
+        if let Err(e) = ops.write_vendor_config(prev) {
+            log::error!("Failed to restore config for {:?}: {}", prev, e);
+            success = false;
+        }
+
+        if prev == GraphicsMode::Integrated {
+            ops.stop_nvidia_services();
+            ops.kill_nvidia_device_users();
+            for module in &["nvidia-drm", "nvidia-modeset", "nvidia_uvm", "nvidia"] {
+                if let Err(why) = ops.unload_module(module) {
+                    log::warn!("Rollback failed to unload {}: {}", module, why);
+                }
+            }
+            let runtimepm = nvidia::gpu_supports_runtimepm(&self.nvidia).unwrap_or(false);
+            if !runtimepm {
+                for dev in &self.nvidia {
+                    if ops.unbind_device(dev).is_err() {
+                        success = false;
+                    }
+                    if ops.remove_device(dev).is_err() {
+                        success = false;
+                    }
+                }
+            }
+        } else {
+            if ops.rescan_pci().is_err() {
+                success = false;
+            }
+            let _ = ops.udev_settle();
+            let _ = ops.refresh_inventory(self);
+            if let Err(e) = ops.load_modules_for_mode(prev) {
+                log::warn!("Rollback failed to load modules for {:?}: {}", prev, e);
+                success = false;
+            }
+            ops.start_enabled_nvidia_services();
+        }
+
+        if success {
+            Ok(())
+        } else {
+            Err(GraphicsDeviceError::Command {
+                cmd: "rollback",
+                why: io::Error::other("rollback steps failed"),
+            })
+        }
     }
 
     pub fn get_power(&self) -> Result<bool, GraphicsDeviceError> {

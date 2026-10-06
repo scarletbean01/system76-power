@@ -61,6 +61,10 @@
     <method name="GetDesktop">
       <arg name="desktop" type="b" direction="out"/>
     </method>
+
+    <method name="GetGraphicsSwitchStatus">
+      <arg name="status" type="s" direction="out"/>
+    </method>
     
     <signal name="HotPlugDetect">
       <arg name="port" type="t"/>
@@ -72,6 +76,13 @@
 
     <signal name="GraphicsModeChanged">
       <arg name="mode" type="s"/>
+    </signal>
+
+    <signal name="GraphicsSwitchFailed">
+      <arg name="target" type="s"/>
+      <arg name="stage" type="s"/>
+      <arg name="error" type="s"/>
+      <arg name="rolled_back" type="b"/>
     </signal>
 
     <signal name="GraphicsInitramfsDone">
