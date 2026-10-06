@@ -169,7 +169,7 @@ system76-power graphics runtime --status
 ### How It Works
 
 1. **Synchronous Validation & Planning**: The daemon validates the target mode, verifies hardware switchability, probes live driver and connector status, and evaluates the `[graphics] runtime_restart_dm` policy. Incompatible requests or no-ops (`from == to`) return immediately without touching hardware.
-2. **Concurrency Guard**: A mutual exclusion flag (`switch_in_progress`) prevents conflicting switches or runtime PM changes while a switch or initramfs rebuild is active.
+2. **Concurrency Guard**: A mutual exclusion flag (`switch_in_progress`) prevents conflicting switches or hardware manipulation while a live switch is actively executing.
 3. **Display Manager Management**: Managed through an RAII `DmGuard` that restores or restarts the detected display manager (GDM, SDDM, LightDM, greetd) on both success and error.
 4. **Framebuffer & Console Safety**: VT consoles are resolved dynamically; only NVIDIA-bound framebuffers are unbound, preserving iGPU text console output (TTYs) throughout the switch.
 5. **Driver Teardown & Bring-up**: Unloads or loads NVIDIA drivers, sets DRM modeset parameters (`nvidia-drm modeset=1`), loads `nvidia_uvm`, settles udev events, and polls for DRM card readiness.
@@ -617,8 +617,13 @@ system76-power graphics compute
 # Runtime graphics switching (no reboot)
 sudo system76-power graphics runtime integrated
 sudo system76-power graphics runtime hybrid
-sudo system76-power graphics runtime nvidia
 sudo system76-power graphics runtime compute
+
+# Wait for switch completion
+sudo system76-power graphics runtime hybrid --wait
+
+# Check runtime graphics switch status
+system76-power graphics runtime --status
 
 # Check switchable graphics capability
 system76-power graphics switchable
