@@ -280,13 +280,20 @@ pub(crate) fn kill_nvidia_device_users() {
 // ── Module management ─────────────────────────────────────────────────────────
 
 /// Load the kernel modules required for the given graphics mode.
+///
+/// Module load order matters: `nvidia` core must be loaded before
+/// `nvidia-modeset`, which must be loaded before `nvidia-drm`.
+/// For PRIME/DRM modes `nvidia-drm` must be loaded with `modeset=1`.
 pub(crate) fn load_modules_for_mode(vendor: GraphicsMode) -> Result<(), GraphicsDeviceError> {
     match vendor {
         GraphicsMode::Integrated => {
+            // Nothing to load; the NVIDIA driver stack stays absent.
             log::info!("Integrated mode: no NVIDIA modules to load");
             Ok(())
         }
         GraphicsMode::Compute => {
+            // nvidia core only — drm/modeset remain blacklisted so the GPU is
+            // accessible for CUDA but does not participate in display.
             modprobe::load("nvidia", &[])
                 .map_err(|why| GraphicsDeviceError::ModuleLoad { module: "nvidia", why })?;
             if let Err(why) = modprobe::load("nvidia_uvm", &[]) {
@@ -299,6 +306,8 @@ pub(crate) fn load_modules_for_mode(vendor: GraphicsMode) -> Result<(), Graphics
                 .map_err(|why| GraphicsDeviceError::ModuleLoad { module: "nvidia", why })?;
             modprobe::load("nvidia-modeset", &[])
                 .map_err(|why| GraphicsDeviceError::ModuleLoad { module: "nvidia-modeset", why })?;
+            // modeset=1 is required for PRIME offload (Hybrid) and for DRM
+            // master hand-off (Discrete).
             modprobe::load("nvidia-drm", &["modeset=1"])
                 .map_err(|why| GraphicsDeviceError::ModuleLoad { module: "nvidia-drm", why })?;
             if let Err(why) = modprobe::load("nvidia_uvm", &[]) {
@@ -383,6 +392,16 @@ pub(crate) fn wait_for_drm_card(dev_id: &str, timeout_ms: u64) -> Result<bool, G
 
 // ── NVIDIA service management ─────────────────────────────────────────────────
 
+/// Stop the NVIDIA daemon services that hold open references to the driver stack.
+///
+/// Only the two long-running daemon services are considered:
+/// - `nvidia-powerd`       — NVIDIA power management daemon
+/// - `nvidia-persistenced` — keeps NVIDIA contexts persistent
+///
+/// The oneshot hook services (nvidia-suspend, nvidia-hibernate, nvidia-resume,
+/// nvidia-suspend-then-hibernate) run and exit immediately; they are never
+/// "active" at query time and hold no file-descriptor references, so they are
+/// intentionally skipped.
 pub(crate) fn stop_nvidia_services() {
     const NVIDIA_DAEMONS: &[&str] = &["nvidia-powerd", "nvidia-persistenced"];
 
@@ -398,6 +417,14 @@ pub(crate) fn stop_nvidia_services() {
     }
 }
 
+/// Start NVIDIA daemon services that are enabled in systemd.
+///
+/// Called during bring-up after a runtime switch to a GPU-active mode
+/// (hybrid, compute, nvidia). We check `systemctl is-enabled` rather than
+/// relying on whether the service was running before teardown, because the
+/// prior running state may not reflect the user's intended configuration
+/// (e.g., after a transition from integrated mode where the service was
+/// correctly not running).
 pub(crate) fn start_enabled_nvidia_services() {
     const NVIDIA_DAEMONS: &[&str] = &["nvidia-powerd", "nvidia-persistenced"];
 
@@ -421,6 +448,15 @@ pub(crate) fn start_enabled_nvidia_services() {
 
 // ── PCI power control ─────────────────────────────────────────────────────────
 
+// HACK: Normally, power/control would be set to "auto" by a udev rule in
+// nvidia-drivers, but because of a bug we cannot enable automatic power
+// management too early after turning on the GPU. Otherwise, it will turn off
+// before the NVIDIA driver finishes initializing, leaving the system in an
+// invalid state that will eventually lock up. So defer setting power
+// management using a thread.
+//
+// Ref: pop-os/nvidia-graphics-drivers@f9815ed603bd
+// Ref: system76/firmware-open#160
 pub(crate) fn sysfs_power_control(pciid: String, mode: GraphicsMode) {
     thread::spawn(move || {
         thread::sleep(time::Duration::from_millis(5000));
