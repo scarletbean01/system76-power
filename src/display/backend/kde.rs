@@ -6,7 +6,6 @@
 
 use super::{DisplayManager, is_builtin_display_name};
 use crate::display::command::run_checked;
-use crate::display::mode::ensure_modes_found;
 use crate::display::{DisplayMode, SessionContext};
 use crate::errors::DisplayError;
 
@@ -53,17 +52,7 @@ impl DisplayManager for KdeManager<'_> {
 
         let output = run_checked(self.ctx, "kscreen-doctor", &["--outputs"])?;
 
-        let stdout = strip_ansi(&String::from_utf8_lossy(&output.stdout));
-        log::debug!("kscreen-doctor output:\n{}", stdout);
-
-        let (display_name, modes) =
-            parse_kscreen_builtin_output(&stdout).ok_or(DisplayError::BuiltinDisplayNotFound)?;
-
-        log::info!("Found {} available modes for display '{}'", modes.len(), display_name);
-
-        ensure_modes_found(&modes, &display_name, "kscreen-doctor", &stdout)?;
-
-        Ok((display_name, modes))
+        parse_kscreen_builtin_output(&strip_ansi(&String::from_utf8_lossy(&output.stdout)))
     }
 
     fn apply_mode(&self, display_name: &str, mode: &DisplayMode) -> Result<(), DisplayError> {
@@ -81,8 +70,8 @@ impl DisplayManager for KdeManager<'_> {
 
         run_checked(self.ctx, "kscreen-doctor", &[&mode_arg, &vrr_arg])?;
 
-        log::info!(
-            "Successfully applied mode {}x{}@{}Hz with VRR policy automatic",
+        log::debug!(
+            "Applied mode {}x{}@{}Hz with VRR policy automatic",
             mode.resolution.0,
             mode.resolution.1,
             mode.refresh_rate.round() as u32
@@ -102,8 +91,9 @@ impl DisplayManager for KdeManager<'_> {
 /// Output: 2 HDMI-1 <uuid>
 ///         ...
 /// ```
-/// Returns `None` when no built-in output (eDP-*, LVDS-*) is listed.
-fn parse_kscreen_builtin_output(stdout: &str) -> Option<(String, Vec<DisplayMode>)> {
+/// Fails with [`DisplayError::BuiltinDisplayNotFound`] when no built-in output (eDP-*, LVDS-*)
+/// is listed.
+fn parse_kscreen_builtin_output(stdout: &str) -> Result<(String, Vec<DisplayMode>), DisplayError> {
     let mut display_name: Option<String> = None;
     let mut modes = Vec::new();
 
@@ -128,7 +118,7 @@ fn parse_kscreen_builtin_output(stdout: &str) -> Option<(String, Vec<DisplayMode
         }
     }
 
-    display_name.map(|name| (name, modes))
+    display_name.map(|name| (name, modes)).ok_or(DisplayError::BuiltinDisplayNotFound)
 }
 
 /// Parse kscreen-doctor mode strings from the Modes: section
@@ -220,6 +210,9 @@ mod tests {
         assert_eq!(modes[0].resolution, (2560, 1600));
 
         let external_only = "Output: 1 HDMI-1 uuid\n  Modes:  1:1920x1080@60.00*!\n";
-        assert!(parse_kscreen_builtin_output(external_only).is_none());
+        assert!(matches!(
+            parse_kscreen_builtin_output(external_only),
+            Err(DisplayError::BuiltinDisplayNotFound)
+        ));
     }
 }

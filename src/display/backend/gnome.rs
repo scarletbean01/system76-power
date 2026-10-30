@@ -6,7 +6,6 @@
 
 use super::{DisplayManager, find_builtin_display_name, is_builtin_display_name};
 use crate::display::command::run_checked;
-use crate::display::mode::ensure_modes_found;
 use crate::display::{DisplayMode, SessionContext};
 use crate::errors::DisplayError;
 
@@ -15,53 +14,40 @@ pub(super) struct GnomeManager<'a> {
     pub(super) ctx: &'a SessionContext,
 }
 
+/// Extract the built-in display's name and modes from `gnome-randr query`.
+///
+/// The display's section starts at an unindented line beginning with its name;
+/// its modes are the indented lines after it that contain an `@`.
+fn parse_gnome_output(stdout: &str) -> Result<(String, Vec<DisplayMode>), DisplayError> {
+    let display_name = find_builtin_display_name(stdout.lines(), |line| {
+        let trimmed = line.trim();
+        is_builtin_display_name(trimmed) && !trimmed.contains("disconnected")
+    })
+    .ok_or(DisplayError::BuiltinDisplayNotFound)?;
+
+    let modes = stdout
+        .lines()
+        .skip_while(|line| is_indented(line) || !line.starts_with(display_name.as_str()))
+        .skip(1)
+        .take_while(|line| is_indented(line))
+        .filter(|line| line.contains('@'))
+        .filter_map(parse_gnome_mode_line)
+        .collect();
+
+    Ok((display_name, modes))
+}
+
+fn is_indented(line: &str) -> bool {
+    line.starts_with([' ', '\t'])
+}
+
 impl DisplayManager for GnomeManager<'_> {
     fn get_display_info(&self) -> Result<(String, Vec<DisplayMode>), DisplayError> {
         log::debug!("Querying gnome-randr for display info (name + modes)");
 
         let output = run_checked(self.ctx, "gnome-randr", &["query"])?;
 
-        let stdout = String::from_utf8_lossy(&output.stdout);
-
-        // Find the built-in display name (eDP-*)
-        let display_name = find_builtin_display_name(stdout.lines(), |line| {
-            let trimmed = line.trim();
-            is_builtin_display_name(trimmed) && !trimmed.contains("disconnected")
-        })
-        .ok_or(DisplayError::BuiltinDisplayNotFound)?;
-
-        // Collect modes for the detected display
-        let mut modes = Vec::new();
-        let mut in_display_section = false;
-
-        log::debug!("Parsing gnome-randr output for display '{}'", display_name);
-
-        for line in stdout.lines() {
-            let trimmed = line.trim_start();
-
-            if !line.starts_with(' ') && !line.starts_with('\t') {
-                if line.starts_with(display_name.as_str()) {
-                    log::debug!("Found display section: {}", line);
-                    in_display_section = true;
-                    continue;
-                } else if in_display_section {
-                    log::debug!("Exiting display section (found different display)");
-                    break;
-                }
-            }
-
-            if in_display_section && trimmed.len() < line.len() && trimmed.contains('@') {
-                if let Some(mode) = parse_gnome_mode_line(line) {
-                    modes.push(mode);
-                }
-            }
-        }
-
-        log::info!("Found {} available modes for display '{}'", modes.len(), display_name);
-
-        ensure_modes_found(&modes, &display_name, "gnome-randr", &stdout)?;
-
-        Ok((display_name, modes))
+        parse_gnome_output(&String::from_utf8_lossy(&output.stdout))
     }
 
     fn apply_mode(&self, display_name: &str, mode: &DisplayMode) -> Result<(), DisplayError> {
@@ -76,7 +62,7 @@ impl DisplayManager for GnomeManager<'_> {
 }
 
 /// Parse a mode line from gnome-randr output
-/// Example input: "    2560x1440@165.001+vrr	2560x1440 	165.00    	[scales...]"
+/// Example input: `"    2560x1440@165.001+vrr  2560x1440  165.00  [scales...]"`
 fn parse_gnome_mode_line(line: &str) -> Option<DisplayMode> {
     let trimmed = line.trim();
     if trimmed.is_empty() {
@@ -105,15 +91,6 @@ fn parse_gnome_mode_line(line: &str) -> Option<DisplayMode> {
     let height = height_str.parse::<u32>().ok()?;
     let refresh_rate = rate_part.parse::<f32>().ok()?;
 
-    log::debug!(
-        "Parsed mode: {} → {}x{} @ {:.2}Hz (VRR: {})",
-        mode_string,
-        width,
-        height,
-        refresh_rate,
-        has_vrr
-    );
-
     // gnome-randr does not mark the active mode in a machine-readable way here
     Some(DisplayMode {
         mode_string,
@@ -122,4 +99,40 @@ fn parse_gnome_mode_line(line: &str) -> Option<DisplayMode> {
         has_vrr,
         is_current: false,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Hand-written to the layout `parse_gnome_output` documents (no captured
+    /// `gnome-randr` output was available): a section per display, modes indented.
+    const QUERY: &str = "\
+HDMI-1 connected
+    1920x1080@60.000    1920x1080    60.00
+eDP-1 connected primary
+    2560x1600@240.001+vrr    2560x1600    240.00
+    2560x1600@60.002    2560x1600    60.00
+DP-2 disconnected
+    1280x720@60.000    1280x720    60.00
+";
+
+    #[test]
+    fn test_parse_gnome_output_reads_only_the_builtin_section() {
+        let (name, modes) = parse_gnome_output(QUERY).expect("built-in found");
+
+        assert_eq!(name, "eDP-1");
+        assert_eq!(modes.len(), 2);
+        assert_eq!(modes[0].mode_string, "2560x1600@240.001+vrr");
+        assert!(modes[0].has_vrr);
+        assert_eq!(modes[1].resolution, (2560, 1600));
+        assert_eq!(modes[1].refresh_rate, 60.002);
+    }
+
+    #[test]
+    fn test_parse_gnome_output_without_builtin_display() {
+        let query = "HDMI-1 connected\n    1920x1080@60.000    1920x1080    60.00\n";
+
+        assert!(matches!(parse_gnome_output(query), Err(DisplayError::BuiltinDisplayNotFound)));
+    }
 }

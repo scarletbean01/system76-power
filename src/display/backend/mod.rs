@@ -48,7 +48,7 @@ pub(super) fn create_manager(
         .or_else(|| DisplayServer::detect(&SessionEnv::from_process()))
         .unwrap_or(DisplayServer::Unknown);
 
-    log::info!("Detected display server: {:?}", display_server);
+    log::debug!("Detected display server: {:?}", display_server);
 
     match display_server {
         DisplayServer::GnomeWayland => {

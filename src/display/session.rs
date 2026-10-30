@@ -6,7 +6,6 @@
 //! their compositor runs with.
 
 use std::collections::BTreeMap;
-use std::io;
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -108,14 +107,34 @@ impl FromIterator<(String, String)> for SessionEnv {
     }
 }
 
-/// Session information from loginctl
-#[derive(Debug)]
-struct SessionInfo {
+/// A login session as listed by `loginctl list-sessions`.
+struct SessionEntry {
     id: String,
     user: String,
+}
+
+/// Session information from `loginctl show-session`.
+#[derive(Debug, Default)]
+struct SessionInfo {
     seat: String,
     session_type: Option<String>,
     state: Option<String>,
+}
+
+impl SessionInfo {
+    /// A Wayland or X11 session (as opposed to a tty).
+    fn is_graphical(&self) -> bool {
+        matches!(self.session_type.as_deref(), Some("wayland" | "x11"))
+    }
+
+    fn is_active(&self) -> bool {
+        self.state.as_deref() == Some("active")
+    }
+
+    /// On the primary graphics seat.
+    fn is_primary_seat(&self) -> bool {
+        self.seat == "seat0"
+    }
 }
 
 /// The account owning the graphical session.
@@ -161,169 +180,123 @@ pub struct SessionContext {
     pub env: SessionEnv,
 }
 
-/// Query detailed information about a specific session
-fn query_session_details(session_id: &str) -> Result<SessionInfo, io::Error> {
-    let output = Command::new("loginctl")
-        .arg("show-session")
-        .arg(session_id)
-        .arg("--property=Type")
-        .arg("--property=State")
-        .arg("--property=Seat")
-        .arg("--property=Name")
-        .output()?;
+/// Run `loginctl` and return its stdout.
+fn loginctl(args: &[&str]) -> Result<String, DisplayError> {
+    let output = Command::new("loginctl").args(args).output()?;
 
     if !output.status.success() {
-        return Err(io::Error::new(
-            io::ErrorKind::Other,
-            format!("Failed to query session {}", session_id),
-        ));
+        return Err(DisplayError::CommandFailed {
+            command: format!("loginctl {}", args.join(" ")),
+            stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        });
     }
 
-    let info = String::from_utf8_lossy(&output.stdout);
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
 
-    let mut session_type = None;
-    let mut state = None;
-    let mut seat = String::from("seat0"); // Default
-    let mut user = String::new();
+/// List the login sessions of all users.
+fn list_sessions() -> Result<Vec<SessionEntry>, DisplayError> {
+    let sessions = loginctl(&["list-sessions", "--no-legend"])?;
 
-    for line in info.lines() {
-        if let Some((key, value)) = line.split_once('=') {
-            match key {
-                "Type" => session_type = Some(value.to_string()),
-                "State" => state = Some(value.to_string()),
-                "Seat" => seat = value.to_string(),
-                "Name" => user = value.to_string(),
-                _ => {}
-            }
+    // Columns: SESSION UID USER SEAT TTY
+    Ok(sessions
+        .lines()
+        .filter_map(|line| {
+            let mut columns = line.split_whitespace();
+            let id = columns.next()?.to_string();
+            let user = columns.nth(1)?.to_string();
+
+            Some(SessionEntry { id, user })
+        })
+        .collect())
+}
+
+/// Query detailed information about a specific session
+fn query_session_details(session_id: &str) -> Result<SessionInfo, DisplayError> {
+    let info = loginctl(&[
+        "show-session",
+        session_id,
+        "--property=Type",
+        "--property=State",
+        "--property=Seat",
+    ])?;
+
+    let mut session = SessionInfo { seat: String::from("seat0"), ..Default::default() };
+
+    for (key, value) in info.lines().filter_map(|line| line.split_once('=')) {
+        match key {
+            "Type" => session.session_type = Some(value.to_string()),
+            "State" => session.state = Some(value.to_string()),
+            "Seat" => session.seat = value.to_string(),
+            _ => {}
         }
     }
 
-    log::debug!(
-        "Session {} details: type={:?}, state={:?}, seat={}, user={}",
-        session_id,
-        session_type,
-        state,
-        seat,
-        user
-    );
+    log::debug!("Session {} details: {:?}", session_id, session);
 
-    Ok(SessionInfo { id: session_id.to_string(), user, seat, session_type, state })
-}
-
-/// Check if a session is a graphical session (Wayland or X11)
-fn is_graphical_session(session: &SessionInfo) -> bool {
-    matches!(session.session_type.as_deref(), Some("wayland") | Some("x11"))
-}
-
-/// Check if a session is active
-fn is_active_session(session: &SessionInfo) -> bool {
-    session.state.as_deref() == Some("active")
-}
-
-/// Check if a session is on the primary graphics seat
-fn is_primary_seat(session: &SessionInfo) -> bool {
-    session.seat == "seat0"
+    Ok(session)
 }
 
 /// Get the username running the active graphical session
-fn get_display_user() -> Result<String, io::Error> {
+fn get_display_user() -> Result<String, DisplayError> {
     log::debug!("Detecting display user");
 
     // Method 1: Check SUDO_USER environment variable (when run via sudo)
-    if let Ok(user) = std::env::var("SUDO_USER") {
-        if !user.is_empty() && user != "root" {
-            log::debug!("Found display user from SUDO_USER: {}", user);
-            return Ok(user);
-        }
+    if let Some(user) = std::env::var("SUDO_USER").ok().filter(|u| !u.is_empty() && u != "root") {
+        log::debug!("Found display user from SUDO_USER: {}", user);
+        return Ok(user);
     }
 
-    // Method 2: Find active graphical session via loginctl
-    let output = Command::new("loginctl").arg("list-sessions").arg("--no-legend").output()?;
-
-    if !output.status.success() {
-        return Err(io::Error::new(io::ErrorKind::Other, "loginctl list-sessions failed"));
-    }
-
-    let sessions = String::from_utf8_lossy(&output.stdout);
-
-    log::debug!("Scanning sessions for active graphical session");
-
-    // Collect and analyze sessions
-    let mut candidates: Vec<(String, String)> = Vec::new(); // (session_id, user)
-
-    for line in sessions.lines() {
-        let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.len() < 3 {
-            continue;
-        }
-
-        let session_id = parts[0];
-        let user = parts[2];
-
-        // Skip root sessions
-        if user == "root" {
-            log::debug!("Skipping root session: {}", session_id);
-            continue;
-        }
-
-        candidates.push((session_id.to_string(), user.to_string()));
-    }
+    // Method 2: Find an active graphical session via loginctl
+    let candidates: Vec<SessionEntry> =
+        list_sessions()?.into_iter().filter(|session| session.user != "root").collect();
 
     log::debug!("Found {} non-root sessions to evaluate", candidates.len());
 
-    // Priority 1: Active graphical session on seat0
-    for (session_id, user) in &candidates {
-        match query_session_details(session_id) {
-            Ok(session) => {
-                if is_graphical_session(&session)
-                    && is_active_session(&session)
-                    && is_primary_seat(&session)
-                {
-                    log::info!(
-                        "Found ideal session: user={}, session={}, type={:?}, seat={}",
-                        user,
-                        session_id,
-                        session.session_type,
-                        session.seat
-                    );
-                    return Ok(user.clone());
-                }
-            }
+    let sessions: Vec<(&SessionEntry, SessionInfo)> = candidates
+        .iter()
+        .filter_map(|entry| match query_session_details(&entry.id) {
+            Ok(info) => Some((entry, info)),
             Err(e) => {
-                log::debug!("Failed to query session {}: {}", session_id, e);
+                log::debug!("Failed to query session {}: {}", entry.id, e);
+                None
             }
-        }
+        })
+        .collect();
+
+    // Priority 1: Active graphical session on seat0
+    if let Some((entry, info)) = sessions
+        .iter()
+        .find(|(_, info)| info.is_graphical() && info.is_active() && info.is_primary_seat())
+    {
+        log::info!(
+            "Found ideal session: user={}, session={}, type={:?}, seat={}",
+            entry.user,
+            entry.id,
+            info.session_type,
+            info.seat
+        );
+        return Ok(entry.user.clone());
     }
 
     // Priority 2: Any graphical session (relaxed seat/state requirements)
-    for (session_id, user) in &candidates {
-        match query_session_details(session_id) {
-            Ok(session) => {
-                if is_graphical_session(&session) {
-                    log::warn!(
-                        "Using graphical session (not ideal): user={}, session={}, type={:?}, state={:?}, seat={}",
-                        user,
-                        session_id,
-                        session.session_type,
-                        session.state,
-                        session.seat
-                    );
-                    return Ok(user.clone());
-                }
-            }
-            Err(e) => {
-                log::debug!("Failed to query session {}: {}", session_id, e);
-            }
-        }
+    if let Some((entry, info)) = sessions.iter().find(|(_, info)| info.is_graphical()) {
+        log::warn!(
+            "Using graphical session (not ideal): user={}, session={}, type={:?}, state={:?}, seat={}",
+            entry.user,
+            entry.id,
+            info.session_type,
+            info.state,
+            info.seat
+        );
+        return Ok(entry.user.clone());
     }
 
     // Priority 3: Fallback - first non-root user (original behavior)
-    if let Some((_, user)) = candidates.first() {
-        log::warn!("No graphical session found, using first non-root user as fallback: {}", user);
-        return Ok(user.clone());
-    }
+    let first = candidates.first().ok_or(DisplayError::SessionNotFound)?;
+    log::warn!("No graphical session found, using first non-root user as fallback: {}", first.user);
 
-    Err(io::Error::new(io::ErrorKind::NotFound, "No display user found (no non-root sessions)"))
+    Ok(first.user.clone())
 }
 
 /// Find the PID of a compositor process for a specific user
@@ -359,48 +332,26 @@ pub(super) fn find_compositor_pid(user: &str) -> Option<String> {
 }
 
 /// Find the session leader PID for a user via loginctl
-fn find_session_leader_pid(user: &str) -> Result<String, io::Error> {
+fn find_session_leader_pid(user: &str) -> Result<String, DisplayError> {
     log::debug!("Finding session leader for user: {}", user);
 
-    let session_output =
-        Command::new("loginctl").arg("list-sessions").arg("--no-legend").output()?;
-
-    let sessions = String::from_utf8_lossy(&session_output.stdout);
-
-    for line in sessions.lines() {
-        let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.len() >= 3 && parts[2] == user {
-            let session_id = parts[0];
-            log::debug!("Found session {} for user {}", session_id, user);
-
-            let leader_output = Command::new("loginctl")
-                .arg("show-session")
-                .arg(session_id)
-                .arg("--property=Leader")
-                .arg("--value")
-                .output()?;
-
-            if leader_output.status.success() {
-                let pid = String::from_utf8_lossy(&leader_output.stdout).trim().to_string();
-                log::info!("Session leader PID: {}", pid);
-                return Ok(pid);
-            }
-        }
-    }
-
-    Err(io::Error::new(
-        io::ErrorKind::NotFound,
-        format!("Could not find session leader for user {}", user),
-    ))
+    list_sessions()?
+        .into_iter()
+        .filter(|session| session.user == user)
+        .find_map(|session| {
+            loginctl(&["show-session", &session.id, "--property=Leader", "--value"]).ok()
+        })
+        .map(|leader| leader.trim().to_string())
+        .inspect(|pid| log::debug!("Session leader PID: {}", pid))
+        .ok_or_else(|| DisplayError::SessionLeaderNotFound(user.to_string()))
 }
 
 /// Read the session environment variables from /proc/<pid>/environ
-fn read_process_environment(pid: &str) -> Result<SessionEnv, io::Error> {
+fn read_process_environment(pid: &str) -> Result<SessionEnv, DisplayError> {
     log::debug!("Reading environment from PID: {}", pid);
 
-    let environ_path = format!("/proc/{}/environ", pid);
-    let environ_data = std::fs::read(&environ_path)
-        .map_err(|e| io::Error::new(e.kind(), format!("Failed to read {}: {}", environ_path, e)))?;
+    let environ_data = std::fs::read(format!("/proc/{}/environ", pid))
+        .map_err(|source| DisplayError::ProcessEnvironment { pid: pid.to_string(), source })?;
 
     let env = SessionEnv::from_environ_block(&environ_data);
 
@@ -410,16 +361,16 @@ fn read_process_environment(pid: &str) -> Result<SessionEnv, io::Error> {
         for (key, value) in env.iter() {
             log::debug!("Found env: {}={}", key, value);
         }
-        log::info!("Extracted {} environment variables from PID {}", env.len(), pid);
+        log::debug!("Extracted {} environment variables from PID {}", env.len(), pid);
     }
 
     Ok(env)
 }
 
 /// Get the display environment of the user session
-pub(super) fn get_user_session_env(account: &UserAccount) -> Result<SessionEnv, io::Error> {
+pub(super) fn get_user_session_env(account: &UserAccount) -> Result<SessionEnv, DisplayError> {
     let user = account.name.as_str();
-    log::info!("Getting session environment for user: {}", user);
+    log::debug!("Getting session environment for user: {}", user);
 
     // Strategy 1: Find compositor process (most reliable for display environment)
     if let Some(pid) = find_compositor_pid(user) {
@@ -439,10 +390,7 @@ pub(super) fn get_user_session_env(account: &UserAccount) -> Result<SessionEnv, 
     let mut env = read_process_environment(&pid)?;
 
     if env.is_empty() {
-        return Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            format!("No display environment variables found for user {}", user),
-        ));
+        return Err(DisplayError::NoDisplayEnvironment(user.to_string()));
     }
 
     complete_session_env(account, &mut env);
@@ -495,12 +443,12 @@ fn discover_wayland_display(env: &SessionEnv) -> Option<String> {
 /// Get session context (user + environment) - call this once and pass it around
 /// This avoids redundant session detection and environment extraction
 pub fn get_session_context() -> Result<SessionContext, DisplayError> {
-    log::info!("=== Fetching Session Context (once) ===");
+    log::debug!("Fetching session context");
 
     let account = get_display_account()?;
     let env = get_user_session_env(&account)?;
 
-    log::info!("Session context ready: user={}, env_vars={}", account.name, env.len());
+    log::debug!("Session context ready: user={}, env_vars={}", account.name, env.len());
 
     Ok(SessionContext { account, env })
 }

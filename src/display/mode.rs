@@ -4,8 +4,6 @@
 
 //! Display modes and selection of the mode matching a request.
 
-use std::io;
-
 use crate::config::ModeSpec;
 use crate::errors::DisplayError;
 
@@ -24,26 +22,6 @@ pub struct DisplayMode {
     pub is_current: bool,
 }
 
-/// Ensure modes were found, returning an appropriate error if empty
-///
-/// This helper encapsulates the common "no modes found" error handling pattern
-/// used by all display managers.
-pub(super) fn ensure_modes_found(
-    modes: &[DisplayMode],
-    display_name: &str,
-    tool_name: &str,
-    raw_output: &str,
-) -> Result<(), DisplayError> {
-    if modes.is_empty() {
-        log::warn!("No modes found! {} output:\n{}", tool_name, raw_output);
-        return Err(DisplayError::ModeNotFound {
-            display: display_name.to_string(),
-            spec: "any".to_string(),
-        });
-    }
-    Ok(())
-}
-
 /// Find the best matching mode for a target refresh rate
 /// Prefers VRR modes if available, and selects closest matching rate
 pub(super) fn find_best_mode<'a>(
@@ -56,7 +34,7 @@ pub(super) fn find_best_mode<'a>(
         return None;
     }
 
-    log::info!(
+    log::debug!(
         "Finding best mode for target {}Hz from {} available modes (prefer VRR: {})",
         target_rate,
         modes.len(),
@@ -86,7 +64,7 @@ pub(super) fn find_best_mode<'a>(
     });
 
     if let Some(mode) = best {
-        log::info!(
+        log::debug!(
             "Selected best mode: {} ({}x{} @ {:.2}Hz, VRR: {}) - diff: {:.2}Hz",
             mode.mode_string,
             mode.resolution.0,
@@ -114,7 +92,7 @@ pub(super) fn modes_for_rate_change(modes: &[DisplayMode]) -> Vec<&DisplayMode> 
     let same_resolution: Vec<&DisplayMode> =
         modes.iter().filter(|m| m.resolution == resolution).collect();
 
-    log::info!(
+    log::debug!(
         "Keeping current resolution {}x{} ({} matching modes)",
         resolution.0,
         resolution.1,
@@ -124,10 +102,27 @@ pub(super) fn modes_for_rate_change(modes: &[DisplayMode]) -> Vec<&DisplayMode> 
     same_resolution
 }
 
-/// Select the best matching display mode from available modes based on specification
+/// Absolute difference between two refresh rates in millihertz, for integer comparison.
+fn millihertz_diff(a: f32, b: f32) -> u32 {
+    ((a - b).abs() * 1000.0) as u32
+}
+
+/// Select the mode for a refresh-rate-only change.
 ///
-/// This helper function encapsulates the common mode selection logic used by both
-/// GNOME Wayland and X11 backends.
+/// The resolution is kept (see [`modes_for_rate_change`]) and VRR modes are preferred.
+pub(super) fn select_for_rate(
+    available_modes: &[DisplayMode],
+    rate: u32,
+    display_name: &str,
+) -> Result<DisplayMode, DisplayError> {
+    let candidates = modes_for_rate_change(available_modes);
+
+    find_best_mode(&candidates, rate, true)
+        .cloned()
+        .ok_or_else(|| mode_not_found(display_name, format!("{}Hz", rate)))
+}
+
+/// Select the best matching display mode from available modes based on specification
 ///
 /// # Arguments
 /// * `available_modes` - Slice of available DisplayMode options from the display
@@ -136,103 +131,84 @@ pub(super) fn modes_for_rate_change(modes: &[DisplayMode]) -> Vec<&DisplayMode> 
 /// * `prefer_vrr` - Whether to prefer VRR modes when using ResolutionAndRate
 ///
 /// # Returns
-/// The best matching DisplayMode (cloned), or an error if no suitable mode found
+/// The best matching DisplayMode (cloned), or [`DisplayError::ModeNotFound`]
 pub(super) fn select_best_mode(
     available_modes: &[DisplayMode],
     mode_spec: &ModeSpec,
     display_name: &str,
     prefer_vrr: bool,
-) -> Result<DisplayMode, io::Error> {
-    match mode_spec {
-        ModeSpec::ModeString(mode_str) => {
-            // Accept the "…Hz" suffix that `hyprctl monitors` prints, so specs
-            // copied from it (or from `system76-power.conf` examples) still match
-            // the canonical, suffix-free mode strings we store.
-            let mode_str = mode_str.trim_end_matches("Hz").trim_end_matches("hz");
+) -> Result<DisplayMode, DisplayError> {
+    let (selected, spec) = match mode_spec {
+        ModeSpec::ModeString(spec) => (select_by_mode_string(available_modes, spec), spec.clone()),
+        ModeSpec::ResolutionAndRate(width, height, hz) => (
+            select_by_resolution_and_rate(available_modes, (*width, *height), *hz, prefer_vrr),
+            format!("{}x{}@{}Hz", width, height, hz),
+        ),
+    };
 
-            // Try exact mode string match first
-            if let Some(mode) = available_modes.iter().find(|m| m.mode_string == *mode_str) {
-                return Ok(mode.clone());
-            }
+    selected.cloned().ok_or_else(|| mode_not_found(display_name, spec))
+}
 
-            log::warn!("Exact mode string '{}' not found, trying fuzzy match", mode_str);
+fn mode_not_found(display_name: &str, spec: String) -> DisplayError {
+    DisplayError::ModeNotFound { display: display_name.to_string(), spec }
+}
 
-            // Fuzzy match: strip VRR suffix and compare
-            let mode_str_no_vrr = mode_str.replace("+vrr", "");
-            if let Some(mode) = available_modes
-                .iter()
-                .find(|m| m.mode_string.replace("+vrr", "") == mode_str_no_vrr)
-            {
-                return Ok(mode.clone());
-            }
+/// Match an explicit mode string, from the exact form down to the closest rate.
+fn select_by_mode_string<'a>(modes: &'a [DisplayMode], spec: &str) -> Option<&'a DisplayMode> {
+    // Accept the "…Hz" suffix that `hyprctl monitors` prints, so specs
+    // copied from it (or from `system76-power.conf` examples) still match
+    // the canonical, suffix-free mode strings we store.
+    let spec = spec.trim_end_matches("Hz").trim_end_matches("hz");
 
-            // More aggressive fuzzy match: parse resolution and rate, find closest match
-            // This handles cases like "2560x1440@60.002" matching "2560x1440@60"
-            log::warn!("VRR-stripped match failed, trying resolution+rate parsing");
-
-            if let Some((res_part, rate_part)) = mode_str_no_vrr.split_once('@') {
-                if let Some((width_str, height_str)) = res_part.split_once('x') {
-                    if let (Ok(width), Ok(height), Ok(target_rate)) = (
-                        width_str.parse::<u32>(),
-                        height_str.parse::<u32>(),
-                        rate_part.parse::<f32>(),
-                    ) {
-                        // Filter by resolution and find closest refresh rate
-                        let filtered: Vec<_> = available_modes
-                            .iter()
-                            .filter(|m| m.resolution.0 == width && m.resolution.1 == height)
-                            .collect();
-
-                        if let Some(best) = filtered.iter().min_by_key(|m| {
-                            let diff = (m.refresh_rate - target_rate).abs();
-                            (diff * 1000.0) as u32
-                        }) {
-                            log::info!(
-                                "Fuzzy matched '{}' to '{}' (diff: {:.3}Hz)",
-                                mode_str,
-                                best.mode_string,
-                                (best.refresh_rate - target_rate).abs()
-                            );
-                            return Ok((*best).clone());
-                        }
-                    }
-                }
-            }
-
-            Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("Mode '{}' not found on display {}", mode_str, display_name),
-            ))
-        }
-        ModeSpec::ResolutionAndRate(width, height, hz) => {
-            // Filter modes by resolution
-            let filtered: Vec<&DisplayMode> = available_modes
-                .iter()
-                .filter(|m| m.resolution.0 == *width && m.resolution.1 == *height)
-                .collect();
-
-            if filtered.is_empty() {
-                return Err(io::Error::new(
-                    io::ErrorKind::NotFound,
-                    format!(
-                        "No modes found for resolution {}x{} on display {}",
-                        width, height, display_name
-                    ),
-                ));
-            }
-
-            // Find best match by refresh rate (with optional VRR preference)
-            find_best_mode(&filtered, *hz, prefer_vrr).cloned().ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::NotFound,
-                    format!(
-                        "No suitable mode found for {}x{}@{}Hz on display {}",
-                        width, height, hz, display_name
-                    ),
-                )
-            })
-        }
+    if let Some(mode) = modes.iter().find(|m| m.mode_string == spec) {
+        return Some(mode);
     }
+
+    log::warn!("Exact mode string '{}' not found, trying fuzzy match", spec);
+
+    let spec_no_vrr = spec.replace("+vrr", "");
+    if let Some(mode) = modes.iter().find(|m| m.mode_string.replace("+vrr", "") == spec_no_vrr) {
+        return Some(mode);
+    }
+
+    // This handles cases like "2560x1440@60.002" matching "2560x1440@60".
+    log::warn!("VRR-stripped match failed, trying resolution+rate parsing");
+
+    let (resolution, rate) = parse_resolution_and_rate(&spec_no_vrr)?;
+    let best = modes
+        .iter()
+        .filter(|m| m.resolution == resolution)
+        .min_by_key(|m| millihertz_diff(m.refresh_rate, rate))?;
+
+    log::info!(
+        "Fuzzy matched '{}' to '{}' (diff: {:.3}Hz)",
+        spec,
+        best.mode_string,
+        (best.refresh_rate - rate).abs()
+    );
+
+    Some(best)
+}
+
+/// Parse `"<width>x<height>@<rate>"` into its resolution and refresh rate.
+fn parse_resolution_and_rate(spec: &str) -> Option<((u32, u32), f32)> {
+    let (resolution, rate) = spec.split_once('@')?;
+    let (width, height) = resolution.split_once('x')?;
+
+    Some(((width.parse().ok()?, height.parse().ok()?), rate.parse().ok()?))
+}
+
+/// Best mode of the given resolution for a target rate, optionally preferring VRR.
+fn select_by_resolution_and_rate(
+    modes: &[DisplayMode],
+    resolution: (u32, u32),
+    hz: u32,
+    prefer_vrr: bool,
+) -> Option<&DisplayMode> {
+    let same_resolution: Vec<&DisplayMode> =
+        modes.iter().filter(|m| m.resolution == resolution).collect();
+
+    find_best_mode(&same_resolution, hz, prefer_vrr)
 }
 
 #[cfg(test)]
@@ -279,6 +255,45 @@ mod tests {
 
     /// Specs copied from `hyprctl monitors` output carry a "Hz" suffix that our
     /// stored mode strings do not; such specs must still resolve to the mode.
+    fn modes() -> Vec<DisplayMode> {
+        vec![mode(2560, 1600, 240.0, true), mode(2560, 1600, 60.0, false)]
+    }
+
+    #[test]
+    fn test_select_best_mode_falls_back_to_the_closest_rate() {
+        let spec = ModeSpec::ModeString("2560x1600@60.002+vrr".to_string());
+        let best = select_best_mode(&modes(), &spec, "eDP-1", false).expect("fuzzy match");
+
+        assert_eq!(best.refresh_rate, 60.0);
+    }
+
+    #[test]
+    fn test_select_best_mode_by_resolution_and_rate() {
+        let spec = ModeSpec::ResolutionAndRate(2560, 1600, 60);
+        let best = select_best_mode(&modes(), &spec, "eDP-1", true).expect("match");
+
+        assert_eq!(best.refresh_rate, 60.0);
+    }
+
+    /// A request nothing matches is a typed error naming the display and the request.
+    #[test]
+    fn test_unmatched_requests_are_mode_not_found() {
+        let wrong_resolution = ModeSpec::ResolutionAndRate(800, 600, 60);
+        let wrong_string = ModeSpec::ModeString("garbage".to_string());
+
+        for spec in [wrong_resolution, wrong_string] {
+            match select_best_mode(&modes(), &spec, "eDP-1", true) {
+                Err(DisplayError::ModeNotFound { display, .. }) => assert_eq!(display, "eDP-1"),
+                other => panic!("expected ModeNotFound, got {:?}", other),
+            }
+        }
+
+        match select_for_rate(&[], 60, "eDP-1") {
+            Err(DisplayError::ModeNotFound { spec, .. }) => assert_eq!(spec, "60Hz"),
+            other => panic!("expected ModeNotFound, got {:?}", other),
+        }
+    }
+
     #[test]
     fn test_select_best_mode_accepts_hz_suffix() {
         let modes = vec![mode(2560, 1600, 240.0, true), mode(2560, 1600, 60.0, false)];

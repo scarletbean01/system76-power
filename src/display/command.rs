@@ -9,6 +9,8 @@ use std::io;
 use std::os::unix::process::CommandExt;
 use std::process::{Command, Output};
 
+use serde::de::DeserializeOwned;
+
 use super::SessionContext;
 use crate::errors::DisplayError;
 
@@ -49,8 +51,16 @@ pub(super) fn run_as_user(
     program: &str,
     args: &[&str],
 ) -> Result<Output, io::Error> {
-    log::debug!("Running as {}: {} {}", ctx.account.name, program, args.join(" "));
-    user_command(ctx, program, args).output()
+    log::debug!("Running as {}: {}", ctx.account.name, command_line(program, args));
+
+    let output = user_command(ctx, program, args).output()?;
+    log::trace!("{} stdout:\n{}", program, String::from_utf8_lossy(&output.stdout));
+
+    Ok(output)
+}
+
+fn command_line(program: &str, args: &[&str]) -> String {
+    std::iter::once(program).chain(args.iter().copied()).collect::<Vec<_>>().join(" ")
 }
 
 /// Run an external program as the session user, failing unless it exits with
@@ -69,8 +79,23 @@ pub(super) fn run_checked(
     }
 
     Err(DisplayError::CommandFailed {
-        command: std::iter::once(program).chain(args.iter().copied()).collect::<Vec<_>>().join(" "),
+        command: command_line(program, args),
         stderr: failure_text(&output),
+    })
+}
+
+/// Run an external program as the session user and deserialize the JSON it
+/// prints, so malformed or incomplete output names the offending field.
+pub(super) fn run_json<T: DeserializeOwned>(
+    ctx: &SessionContext,
+    program: &str,
+    args: &[&str],
+) -> Result<T, DisplayError> {
+    let output = run_checked(ctx, program, args)?;
+
+    serde_json::from_slice(&output.stdout).map_err(|e| DisplayError::ParseError {
+        command: command_line(program, args),
+        reason: e.to_string(),
     })
 }
 

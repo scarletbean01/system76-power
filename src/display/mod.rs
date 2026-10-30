@@ -24,13 +24,11 @@ pub use detect::{DisplayServer, detect_display_server};
 pub use mode::DisplayMode;
 pub use session::{SessionContext, SessionEnv, UserAccount, get_session_context};
 
-use std::io;
-
 use crate::config::ModeSpec;
 use crate::errors::DisplayError;
 
 use backend::create_manager;
-use mode::{find_best_mode, modes_for_rate_change, select_best_mode};
+use mode::{select_best_mode, select_for_rate};
 
 /// Set display refresh rate based on detected display server
 ///
@@ -49,42 +47,12 @@ use mode::{find_best_mode, modes_for_rate_change, select_best_mode};
 /// - No suitable mode is found for the requested refresh rate
 /// - The underlying command (gnome-randr/xrandr) fails
 pub fn set_refresh_rate(rate: u32) -> Result<(), DisplayError> {
-    log::info!("=== Display Refresh Rate Change Request ===");
-    log::info!("Target refresh rate: {}Hz", rate);
+    log::info!("Display refresh rate change request: {}Hz", rate);
 
-    let ctx = get_session_context()?;
-    let manager = create_manager(&ctx)?;
-    let (display_name, available_modes) = manager.get_display_info()?;
-
-    log::info!("Target display: {}", display_name);
-
-    // A refresh rate change must not alter the resolution.
-    let candidates = modes_for_rate_change(&available_modes);
-
-    let best_mode = find_best_mode(&candidates, rate, true).ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::NotFound,
-            format!("No suitable mode found for {}Hz on {}", rate, display_name),
-        )
-    })?;
-
-    log::info!(
-        "Applying mode: {} ({}x{} @ {:.2}Hz, VRR: {})",
-        best_mode.mode_string,
-        best_mode.resolution.0,
-        best_mode.resolution.1,
-        best_mode.refresh_rate,
-        best_mode.has_vrr
-    );
-
-    let result = manager.apply_mode(&display_name, best_mode);
-
-    match &result {
-        Ok(_) => log::info!("=== Display Refresh Rate Change: SUCCESS ==="),
-        Err(e) => log::error!("=== Display Refresh Rate Change: FAILED - {} ===", e),
-    }
-
-    result
+    log_outcome(
+        "Display refresh rate change",
+        apply_display_mode(|modes, display| select_for_rate(modes, rate, display)),
+    )
 }
 
 /// Set display mode (resolution and refresh rate) based on ModeSpec
@@ -104,39 +72,49 @@ pub fn set_refresh_rate(rate: u32) -> Result<(), DisplayError> {
 /// - No suitable mode is found for the requested specification
 /// - The underlying command (gnome-randr/xrandr) fails
 pub fn set_display_mode(mode_spec: &ModeSpec) -> Result<(), DisplayError> {
-    log::info!("=== Display Mode Change Request ===");
+    log::info!("Display mode change request: {:?}", mode_spec);
 
-    match mode_spec {
-        ModeSpec::ModeString(mode_str) => {
-            log::info!("Target mode: {} (explicit mode string)", mode_str);
-        }
-        ModeSpec::ResolutionAndRate(width, height, hz) => {
-            log::info!("Target mode: {}x{}@{}Hz", width, height, hz);
-        }
-    }
+    log_outcome(
+        "Display mode change",
+        apply_display_mode(|modes, display| select_best_mode(modes, mode_spec, display, true)),
+    )
+}
 
+/// The pipeline shared by every display change: find the session, pick the
+/// backend, query the built-in display, let `select` choose a mode among its
+/// modes, and apply it.
+fn apply_display_mode(
+    select: impl FnOnce(&[DisplayMode], &str) -> Result<DisplayMode, DisplayError>,
+) -> Result<(), DisplayError> {
     let ctx = get_session_context()?;
     let manager = create_manager(&ctx)?;
     let (display_name, available_modes) = manager.get_display_info()?;
 
-    log::info!("Target display: {}", display_name);
+    if available_modes.is_empty() {
+        return Err(DisplayError::ModeNotFound { display: display_name, spec: "any".to_string() });
+    }
 
-    let best_mode = select_best_mode(&available_modes, mode_spec, &display_name, true)?;
+    log::info!("Target display: {} ({} modes)", display_name, available_modes.len());
+
+    let mode = select(&available_modes, &display_name)?;
 
     log::info!(
         "Applying mode: {} ({}x{} @ {:.2}Hz, VRR: {})",
-        best_mode.mode_string,
-        best_mode.resolution.0,
-        best_mode.resolution.1,
-        best_mode.refresh_rate,
-        best_mode.has_vrr
+        mode.mode_string,
+        mode.resolution.0,
+        mode.resolution.1,
+        mode.refresh_rate,
+        mode.has_vrr
     );
 
-    let result = manager.apply_mode(&display_name, &best_mode);
+    manager.apply_mode(&display_name, &mode)
+}
 
+/// Log how a display change ended, and pass the result through.
+fn log_outcome(change: &str, result: Result<(), DisplayError>) -> Result<(), DisplayError> {
     match &result {
-        Ok(_) => log::info!("=== Display Mode Change: SUCCESS ==="),
-        Err(e) => log::error!("=== Display Mode Change: FAILED - {} ===", e),
+        Ok(()) => log::info!("{}: success", change),
+        Err(e) => log::error!("{}: failed - {}", change, e),
     }
 
     result

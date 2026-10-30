@@ -4,12 +4,60 @@
 
 //! Hyprland backend.
 
+use serde::Deserialize;
+
 use super::{DisplayManager, is_builtin_display_name};
-use crate::display::command::{failure_text, run_as_user, run_checked};
-use crate::display::mode::ensure_modes_found;
+use crate::display::command::{run_checked, run_json};
 use crate::display::session::find_compositor_pid;
 use crate::display::{DisplayMode, SessionContext, SessionEnv, UserAccount};
 use crate::errors::DisplayError;
+
+/// A monitor as reported by `hyprctl monitors all -j`.
+#[derive(Debug, Deserialize)]
+struct Monitor {
+    name: String,
+    width: u32,
+    height: u32,
+    #[serde(rename = "refreshRate")]
+    refresh_rate: f64,
+    #[serde(default)]
+    x: i32,
+    #[serde(default)]
+    y: i32,
+    #[serde(default = "Monitor::default_scale")]
+    scale: f64,
+    #[serde(rename = "availableModes", default)]
+    available_modes: Vec<String>,
+}
+
+impl Monitor {
+    fn default_scale() -> f64 {
+        1.0
+    }
+
+    /// Whether `mode` is the mode this monitor currently runs.
+    fn is_running(&self, mode: &DisplayMode) -> bool {
+        self.width == mode.resolution.0
+            && self.height == mode.resolution.1
+            && (self.refresh_rate - f64::from(mode.refresh_rate)).abs() < 1.0
+    }
+
+    /// The monitor's modes, with the running one marked.
+    fn modes(&self) -> Vec<DisplayMode> {
+        self.available_modes
+            .iter()
+            .filter_map(|mode| parse_hyprland_mode(mode))
+            .map(|mode| DisplayMode { is_current: self.is_running(&mode), ..mode })
+            .collect()
+    }
+}
+
+/// An instance as reported by `hyprctl instances -j`.
+#[derive(Debug, Deserialize)]
+struct Instance {
+    instance: String,
+    pid: u64,
+}
 
 /// Ensure the environment carries `HYPRLAND_INSTANCE_SIGNATURE` when the
 /// session runs Hyprland.
@@ -30,59 +78,47 @@ pub(in crate::display) fn add_hyprland_signature(account: &UserAccount, env: &mu
 
 /// Find the signature of the active Hyprland instance of `account`.
 ///
-/// Asks `hyprctl instances -j`, which works without `HYPRLAND_INSTANCE_SIGNATURE`
-/// set, and picks the instance whose PID matches the user's compositor process.
-/// Falls back to the single instance directory under `/run/user/<uid>/hypr/`
-/// when `hyprctl` is unavailable; stale directories from crashed sessions rule
-/// that fallback out, so it is only a last resort.
+/// Asks `hyprctl instances -j` first, which works without
+/// `HYPRLAND_INSTANCE_SIGNATURE` set. Falls back to the single instance
+/// directory under `/run/user/<uid>/hypr/` when `hyprctl` is unavailable;
+/// stale directories from crashed sessions rule that fallback out, so it is
+/// only a last resort.
 fn discover_hyprland_signature(account: &UserAccount, env: &SessionEnv) -> Option<String> {
     let ctx = SessionContext { account: account.clone(), env: env.clone() };
 
-    if let Ok(output) = run_as_user(&ctx, "hyprctl", &["instances", "-j"]) {
-        if output.status.success() {
-            match serde_json::from_slice::<Vec<serde_json::Value>>(&output.stdout) {
-                Ok(instances) => {
-                    if instances.len() == 1 {
-                        if let Some(sig) = instances[0]["instance"].as_str() {
-                            return Some(sig.to_string());
-                        }
-                    }
+    signature_from_hyprctl(&ctx).or_else(|| signature_from_runtime_dir(account.uid))
+}
 
-                    // Multiple instances (e.g. one left over from a crashed
-                    // session): identify ours by the compositor PID.
-                    let compositor_pid =
-                        find_compositor_pid(&account.name).and_then(|pid| pid.parse::<u64>().ok());
+fn signature_from_hyprctl(ctx: &SessionContext) -> Option<String> {
+    let instances: Vec<Instance> = run_json(ctx, "hyprctl", &["instances", "-j"])
+        .inspect_err(|e| log::debug!("hyprctl instances failed: {}", e))
+        .ok()?;
 
-                    if let Some(pid) = compositor_pid {
-                        if let Some(sig) = instances
-                            .iter()
-                            .find(|i| i["pid"].as_u64() == Some(pid))
-                            .and_then(|i| i["instance"].as_str())
-                        {
-                            return Some(sig.to_string());
-                        }
-                    }
-
-                    log::debug!(
-                        "Found {} Hyprland instances, none matched our compositor",
-                        instances.len()
-                    );
-                }
-                Err(e) => log::debug!("Failed to parse 'hyprctl instances -j': {}", e),
-            }
-        } else {
-            log::debug!("hyprctl instances failed: {}", failure_text(&output));
-        }
+    if let [only] = instances.as_slice() {
+        return Some(only.instance.clone());
     }
 
-    let mut entries = std::fs::read_dir(format!("/run/user/{}/hypr", account.uid))
-        .ok()?
-        .filter_map(|e| e.ok())
-        .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
-        .map(|e| e.file_name().to_string_lossy().into_owned());
+    // Multiple instances (e.g. one left over from a crashed session):
+    // identify ours by the compositor PID.
+    let compositor_pid: u64 = find_compositor_pid(&ctx.account.name)?.parse().ok()?;
+    let ours = instances.iter().find(|instance| instance.pid == compositor_pid);
 
-    let first = entries.next()?;
-    (entries.next().is_none()).then_some(first)
+    if ours.is_none() {
+        log::debug!("Found {} Hyprland instances, none matched our compositor", instances.len());
+    }
+
+    ours.map(|instance| instance.instance.clone())
+}
+
+fn signature_from_runtime_dir(uid: u32) -> Option<String> {
+    let mut instances = std::fs::read_dir(format!("/run/user/{}/hypr", uid))
+        .ok()?
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+        .map(|entry| entry.file_name().to_string_lossy().into_owned());
+
+    let first = instances.next()?;
+    instances.next().is_none().then_some(first)
 }
 
 /// Hyprland Wayland backend — uses `hyprctl`
@@ -94,15 +130,18 @@ pub(super) struct HyprlandManager<'a> {
     pub(super) ctx: &'a SessionContext,
 }
 
-/// Run `hyprctl monitors all -j` and parse the JSON array.
-fn hyprctl_monitors(ctx: &SessionContext) -> Result<Vec<serde_json::Value>, DisplayError> {
-    let output = run_checked(ctx, "hyprctl", &["monitors", "all", "-j"])?;
+/// Run `hyprctl monitors all -j`.
+fn hyprctl_monitors(ctx: &SessionContext) -> Result<Vec<Monitor>, DisplayError> {
+    run_json(ctx, "hyprctl", &["monitors", "all", "-j"])
+}
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-
-    serde_json::from_str(&stdout).map_err(|e| DisplayError::CommandFailed {
-        command: "hyprctl monitors all -j (parse)".to_string(),
-        stderr: format!("invalid JSON: {}", e),
+/// Query the monitor called `name`.
+fn hyprctl_monitor(ctx: &SessionContext, name: &str) -> Result<Monitor, DisplayError> {
+    hyprctl_monitors(ctx)?.into_iter().find(|monitor| monitor.name == name).ok_or_else(|| {
+        DisplayError::CommandFailed {
+            command: "hyprctl monitors all -j".to_string(),
+            stderr: format!("monitor '{}' not found", name),
+        }
     })
 }
 
@@ -131,128 +170,74 @@ impl DisplayManager for HyprlandManager<'_> {
         // Prefer the built-in display, fall back to the first monitor.
         let monitor = monitors
             .iter()
-            .find(|m| m["name"].as_str().is_some_and(is_builtin_display_name))
+            .find(|monitor| is_builtin_display_name(&monitor.name))
             .or_else(|| monitors.first())
             .ok_or(DisplayError::SessionNotFound)?;
 
-        let display_name = monitor["name"]
-            .as_str()
-            .ok_or_else(|| DisplayError::ParseError {
-                command: "hyprctl monitors all -j".to_string(),
-            })?
-            .to_string();
-
-        let current_res = (monitor["width"].as_u64(), monitor["height"].as_u64());
-        let current_rate = monitor["refreshRate"].as_f64();
-
-        let modes: Vec<DisplayMode> = monitor["availableModes"]
-            .as_array()
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str())
-                    .filter_map(|s| {
-                        let mode = parse_hyprland_mode(s)?;
-                        let is_current = current_res
-                            == (Some(mode.resolution.0 as u64), Some(mode.resolution.1 as u64))
-                            && current_rate
-                                .map(|r| (r - mode.refresh_rate as f64).abs() < 1.0)
-                                .unwrap_or(false);
-                        Some(DisplayMode { is_current, ..mode })
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        log::info!("Found {} available modes for display '{}'", modes.len(), display_name);
-
-        ensure_modes_found(
-            &modes,
-            &display_name,
-            "hyprctl",
-            &serde_json::to_string(&monitor).unwrap_or_default(),
-        )?;
-
-        Ok((display_name, modes))
+        Ok((monitor.name.clone(), monitor.modes()))
     }
 
     fn apply_mode(&self, display_name: &str, mode: &DisplayMode) -> Result<(), DisplayError> {
         // Re-query to rebuild the full monitor rule, preserving position and scale.
-        let monitors = hyprctl_monitors(self.ctx)?;
-        let monitor = monitors
-            .iter()
-            .find(|m| m["name"].as_str() == Some(display_name))
-            .ok_or_else(|| DisplayError::CommandFailed {
-                command: "hyprctl monitors all -j".to_string(),
-                stderr: format!("monitor '{}' not found", display_name),
-            })?;
-
-        let x = monitor["x"].as_i64().unwrap_or(0);
-        let y = monitor["y"].as_i64().unwrap_or(0);
-        let scale = monitor["scale"].as_f64().unwrap_or(1.0);
+        let monitor = hyprctl_monitor(self.ctx, display_name)?;
 
         // Canonical Hyprland mode token; the reported "2560x1600@240.00Hz" form is
         // also accepted, but "Hz" is not part of the documented monitor-rule syntax.
         let mode_arg = mode.mode_string.trim_end_matches("Hz");
+        let scale = format_scale(monitor.scale);
+        let (x, y) = (monitor.x, monitor.y);
 
-        // Hyprland >= 0.50 uses a non-legacy config parser: `hyprctl keyword`
-        // rejects keywords (exit 0, no effect) and config changes must go through
-        // the Lua API. Legacy parsers make `eval` fail, so fall back to `keyword`.
         let lua = format!(
             "hl.monitor({{ output = \"{}\", mode = \"{}\", position = \"{}x{}\", scale = {} }})",
-            display_name,
-            mode_arg,
-            x,
-            y,
-            format_scale(scale)
+            display_name, mode_arg, x, y, scale
         );
+        let rule = format!("{},{},{}x{},{}", display_name, mode_arg, x, y, scale);
 
         // Keep every attempt's diagnostic so a failed verification can explain itself.
-        let mut attempt_errors = String::new();
-
-        if let Err(eval_failure) = run_checked(self.ctx, "hyprctl", &["eval", &lua]) {
-            let DisplayError::CommandFailed { stderr: eval_error, .. } = eval_failure else {
-                return Err(eval_failure);
-            };
-
-            log::debug!("hyprctl eval failed ({}), falling back to keyword monitor", eval_error);
-            attempt_errors.push_str(&format!("eval: {}; ", eval_error));
-
-            let rule = format!("{},{},{}x{},{}", display_name, mode_arg, x, y, format_scale(scale));
-
-            if let Err(keyword_failure) =
-                run_checked(self.ctx, "hyprctl", &["keyword", "monitor", &rule])
-            {
-                let DisplayError::CommandFailed { stderr: keyword_error, .. } = keyword_failure
-                else {
-                    return Err(keyword_failure);
-                };
-
-                attempt_errors.push_str(&format!("keyword: {}", keyword_error));
-                log::error!("hyprctl apply failed: {}", attempt_errors);
-                return Err(DisplayError::CommandFailed {
-                    command: "hyprctl eval hl.monitor".to_string(),
-                    stderr: attempt_errors,
-                });
-            }
-        }
+        let attempt_errors = apply_monitor_rule(self.ctx, &lua, &rule)?;
 
         // `hyprctl` exits 0 even when it rejects a rule, so confirm the mode
         // actually took effect before reporting success.
-        match verify_applied_mode(self.ctx, display_name, mode) {
-            Ok(()) => {}
-            Err(DisplayError::CommandFailed { stderr, .. }) => {
-                let stderr = format!("{}{}", attempt_errors, stderr);
-                log::error!("=== Display Refresh Rate Change: FAILED - {} ===", stderr);
-                return Err(DisplayError::CommandFailed {
-                    command: "hyprctl monitor mode verification".to_string(),
-                    stderr,
-                });
-            }
-            Err(e) => return Err(e),
-        }
-        log::info!("Successfully applied mode {} to {}", mode.mode_string, display_name);
+        verify_applied_mode(self.ctx, display_name, mode).map_err(|e| match e {
+            DisplayError::CommandFailed { stderr, .. } => DisplayError::CommandFailed {
+                command: "hyprctl monitor mode verification".to_string(),
+                stderr: format!("{}{}", attempt_errors, stderr),
+            },
+            other => other,
+        })?;
+
+        log::debug!("Applied mode {} to {}", mode.mode_string, display_name);
 
         Ok(())
+    }
+}
+
+/// Apply a monitor rule, returning the diagnostics of the attempts that failed.
+///
+/// Hyprland >= 0.50 uses a non-legacy config parser: `hyprctl keyword`
+/// rejects keywords (exit 0, no effect) and config changes must go through
+/// the Lua API. Legacy parsers make `eval` fail, so fall back to `keyword`.
+fn apply_monitor_rule(ctx: &SessionContext, lua: &str, rule: &str) -> Result<String, DisplayError> {
+    let eval_error = match run_checked(ctx, "hyprctl", &["eval", lua]) {
+        Ok(_) => return Ok(String::new()),
+        Err(DisplayError::CommandFailed { stderr, .. }) => stderr,
+        Err(other) => return Err(other),
+    };
+
+    log::debug!("hyprctl eval failed ({}), falling back to keyword monitor", eval_error);
+
+    match run_checked(ctx, "hyprctl", &["keyword", "monitor", rule]) {
+        Ok(_) => Ok(format!("eval: {}; ", eval_error)),
+        Err(DisplayError::CommandFailed { stderr: keyword_error, .. }) => {
+            let stderr = format!("eval: {}; keyword: {}", eval_error, keyword_error);
+            log::error!("hyprctl apply failed: {}", stderr);
+
+            Err(DisplayError::CommandFailed {
+                command: "hyprctl eval hl.monitor".to_string(),
+                stderr,
+            })
+        }
+        Err(other) => Err(other),
     }
 }
 
@@ -266,24 +251,9 @@ fn verify_applied_mode(
     display_name: &str,
     mode: &DisplayMode,
 ) -> Result<(), DisplayError> {
-    let monitors = hyprctl_monitors(ctx)?;
-    let monitor =
-        monitors.iter().find(|m| m["name"].as_str() == Some(display_name)).ok_or_else(|| {
-            DisplayError::CommandFailed {
-                command: "hyprctl monitors all -j".to_string(),
-                stderr: format!("monitor '{}' not found after applying mode", display_name),
-            }
-        })?;
+    let monitor = hyprctl_monitor(ctx, display_name)?;
 
-    let width = monitor["width"].as_u64();
-    let height = monitor["height"].as_u64();
-    let rate = monitor["refreshRate"].as_f64();
-
-    let resolution_matches =
-        width == Some(mode.resolution.0 as u64) && height == Some(mode.resolution.1 as u64);
-    let rate_matches = rate.map(|r| (r - mode.refresh_rate as f64).abs() < 1.0).unwrap_or(false);
-
-    if resolution_matches && rate_matches {
+    if monitor.is_running(mode) {
         return Ok(());
     }
 
@@ -294,9 +264,9 @@ fn verify_applied_mode(
             mode.resolution.0,
             mode.resolution.1,
             mode.refresh_rate,
-            width.unwrap_or(0),
-            height.unwrap_or(0),
-            rate.unwrap_or(0.0)
+            monitor.width,
+            monitor.height,
+            monitor.refresh_rate
         ),
     })
 }
@@ -315,8 +285,16 @@ fn format_scale(scale: f64) -> String {
 mod tests {
     use super::*;
 
-    /// `hyprctl` reports modes as "2560x1600@240.00Hz"; the stored mode string must
-    /// be the canonical, suffix-free form used to build monitor rules.
+    /// Trimmed `hyprctl monitors all -j` output: extra fields must be ignored.
+    const MONITORS_JSON: &str = r#"[{
+        "id": 0, "name": "eDP-1", "make": "BOE", "width": 2560, "height": 1600,
+        "refreshRate": 240.00000, "x": 0, "y": 0, "scale": 1.60, "focused": true,
+        "availableModes": ["2560x1600@240.00Hz", "2560x1600@60.00Hz", "1920x1200@240.00Hz"]
+    }, {
+        "id": 1, "name": "HDMI-A-1", "width": 1920, "height": 1080,
+        "refreshRate": 60.00000, "availableModes": ["1920x1080@60.00Hz"]
+    }]"#;
+
     #[test]
     fn test_parse_hyprland_mode() {
         let mode = parse_hyprland_mode("2560x1600@240.00Hz").expect("valid mode");
@@ -327,6 +305,40 @@ mod tests {
 
         assert!(parse_hyprland_mode("2560x1600@240.00").is_none(), "missing Hz suffix");
         assert!(parse_hyprland_mode("garbage").is_none());
+    }
+
+    #[test]
+    fn test_monitor_modes_mark_the_running_mode() {
+        let monitors: Vec<Monitor> = serde_json::from_str(MONITORS_JSON).expect("valid JSON");
+        let modes = monitors[0].modes();
+
+        assert_eq!(modes.len(), 3);
+        let current: Vec<_> = modes.iter().filter(|m| m.is_current).collect();
+        assert_eq!(current.len(), 1);
+        assert_eq!(current[0].mode_string, "2560x1600@240.00");
+
+        assert_eq!((monitors[0].x, monitors[0].y, monitors[0].scale), (0, 0, 1.6));
+        // Optional fields default instead of failing the whole parse.
+        assert_eq!((monitors[1].x, monitors[1].scale), (0, 1.0));
+    }
+
+    #[test]
+    fn test_monitor_missing_required_field_names_it() {
+        let error = serde_json::from_str::<Vec<Monitor>>(r#"[{ "name": "eDP-1", "width": 1 }]"#)
+            .unwrap_err();
+
+        assert!(error.to_string().contains("height"), "{}", error);
+    }
+
+    #[test]
+    fn test_parse_instances() {
+        let instances: Vec<Instance> = serde_json::from_str(
+            r#"[{ "instance": "abc_123", "time": 1, "pid": 4242, "wl_socket": "wayland-1" }]"#,
+        )
+        .expect("valid JSON");
+
+        assert_eq!(instances[0].instance, "abc_123");
+        assert_eq!(instances[0].pid, 4242);
     }
 
     #[test]

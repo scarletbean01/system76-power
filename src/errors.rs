@@ -68,6 +68,15 @@ pub enum DisplayError {
     #[error("No active graphical session found")]
     SessionNotFound,
 
+    #[error("Could not find the session leader of user '{0}'")]
+    SessionLeaderNotFound(String),
+
+    #[error("No display environment variables found for user '{0}'")]
+    NoDisplayEnvironment(String),
+
+    #[error("Failed to read the environment of PID {pid}: {source}")]
+    ProcessEnvironment { pid: String, source: io::Error },
+
     #[error("Could not look up the account of user '{0}'")]
     UserNotFound(String),
 
@@ -77,14 +86,11 @@ pub enum DisplayError {
     #[error("Command '{command}' failed: {stderr}")]
     CommandFailed { command: String, stderr: String },
 
-    #[error("Failed to parse output of '{command}'")]
-    ParseError { command: String },
+    #[error("Failed to parse output of '{command}': {reason}")]
+    ParseError { command: String, reason: String },
 
     #[error("No mode found for display '{display}' matching {spec}")]
     ModeNotFound { display: String, spec: String },
-
-    #[error("Display server not supported: {0}")]
-    UnsupportedBackend(String),
 
     #[error(transparent)]
     Io(#[from] io::Error),

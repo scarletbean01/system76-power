@@ -6,7 +6,6 @@
 
 use super::{DisplayManager, find_builtin_display_name, is_builtin_display_name};
 use crate::display::command::run_checked;
-use crate::display::mode::ensure_modes_found;
 use crate::display::{DisplayMode, SessionContext};
 use crate::errors::DisplayError;
 
@@ -15,88 +14,35 @@ pub(super) struct X11Manager<'a> {
     pub(super) ctx: &'a SessionContext,
 }
 
+/// Extract the built-in display's name and modes from `xrandr --query`.
+///
+/// The display's section starts at its `<name> connected …` header line and
+/// continues over the indented mode lines that follow it.
+fn parse_xrandr_output(stdout: &str) -> Result<(String, Vec<DisplayMode>), DisplayError> {
+    // The leading space keeps "disconnected" outputs from matching.
+    let display_name = find_builtin_display_name(stdout.lines(), |line| {
+        is_builtin_display_name(line) && line.contains(" connected")
+    })
+    .ok_or(DisplayError::BuiltinDisplayNotFound)?;
+
+    let modes = stdout
+        .lines()
+        .skip_while(|line| line.split_whitespace().next() != Some(display_name.as_str()))
+        .skip(1)
+        .take_while(|line| line.starts_with([' ', '\t']))
+        .flat_map(parse_xrandr_mode_line)
+        .collect();
+
+    Ok((display_name, modes))
+}
+
 impl DisplayManager for X11Manager<'_> {
     fn get_display_info(&self) -> Result<(String, Vec<DisplayMode>), DisplayError> {
         log::debug!("Querying xrandr for display info (name + modes)");
 
         let output = run_checked(self.ctx, "xrandr", &["--query"])?;
 
-        let stdout = String::from_utf8_lossy(&output.stdout);
-
-        // Find the built-in display name (eDP-* or LVDS-*)
-        // The leading space keeps "disconnected" outputs from matching.
-        let display_name = find_builtin_display_name(stdout.lines(), |line| {
-            is_builtin_display_name(line) && line.contains(" connected")
-        })
-        .ok_or(DisplayError::BuiltinDisplayNotFound)?;
-
-        // Collect modes for the detected display
-        let mut modes = Vec::new();
-        let mut in_display_section = false;
-        #[allow(unused_assignments)]
-        let mut current_resolution = String::new();
-
-        log::debug!("Parsing xrandr output for display '{}'", display_name);
-
-        for line in stdout.lines() {
-            if line.starts_with(display_name.as_str()) && line.contains("connected") {
-                log::debug!("Found display section: {}", line);
-                in_display_section = true;
-                continue;
-            }
-
-            if in_display_section && !line.starts_with(' ') && !line.starts_with('\t') {
-                log::debug!("Exiting display section");
-                break;
-            }
-
-            if in_display_section {
-                let trimmed = line.trim_start();
-
-                if trimmed.len() < line.len() && trimmed.contains('x') {
-                    if let Some(first_token) = trimmed.split_whitespace().next() {
-                        if first_token.contains('x') {
-                            current_resolution = first_token.to_string();
-
-                            if let Some(mode) = parse_xrandr_mode_line(line, &current_resolution) {
-                                modes.push(mode);
-                            }
-
-                            let parts: Vec<&str> = trimmed.split_whitespace().collect();
-                            for part in parts.iter().skip(1) {
-                                let is_current = part.contains('*');
-                                let rate_str = part.trim_end_matches('+').trim_end_matches('*');
-                                if let Ok(rate) = rate_str.parse::<f32>() {
-                                    if rate > 10.0 {
-                                        let (width_str, height_str) =
-                                            current_resolution.split_once('x').unwrap();
-                                        if let (Ok(width), Ok(height)) =
-                                            (width_str.parse::<u32>(), height_str.parse::<u32>())
-                                        {
-                                            let mode_string =
-                                                format!("{}@{:.2}", current_resolution, rate);
-                                            modes.push(DisplayMode {
-                                                mode_string,
-                                                resolution: (width, height),
-                                                refresh_rate: rate,
-                                                has_vrr: false,
-                                                is_current,
-                                            });
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        log::info!("Found {} available modes for display '{}'", modes.len(), display_name);
-
-        ensure_modes_found(&modes, &display_name, "xrandr", &stdout)?;
-
-        Ok((display_name, modes))
+        parse_xrandr_output(&String::from_utf8_lossy(&output.stdout))
     }
 
     fn apply_mode(&self, display_name: &str, mode: &DisplayMode) -> Result<(), DisplayError> {
@@ -117,45 +63,85 @@ impl DisplayManager for X11Manager<'_> {
     }
 }
 
-/// Parse xrandr mode line
-/// Example input: "   2560x1440     59.95*+  165.00"
-fn parse_xrandr_mode_line(line: &str, resolution: &str) -> Option<DisplayMode> {
-    let trimmed = line.trim();
+/// Parse an xrandr mode line into one mode per refresh rate.
+///
+/// Example input: `"   2560x1440     59.95*+  165.00"`. Each rate may carry a `*`
+/// (currently active) and/or `+` (preferred) marker.
+fn parse_xrandr_mode_line(line: &str) -> Vec<DisplayMode> {
+    let mut tokens = line.split_whitespace();
 
-    // Check if line starts with resolution
-    if !trimmed.starts_with(resolution) {
-        return None;
-    }
+    let Some(resolution) = tokens.next() else {
+        return Vec::new();
+    };
+    let Some((width, height)) = resolution
+        .split_once('x')
+        .and_then(|(width, height)| Some((width.parse().ok()?, height.parse().ok()?)))
+    else {
+        return Vec::new();
+    };
 
-    // Extract refresh rates from the rest of the line
-    let parts: Vec<&str> = trimmed.split_whitespace().collect();
-    if parts.len() < 2 {
-        return None;
-    }
+    tokens
+        .filter_map(|token| {
+            let refresh_rate: f32 = token.trim_end_matches(['+', '*']).parse().ok()?;
 
-    // Find refresh rates (numbers with optional + or *)
-    // The first rate is usually the active one (marked with *)
-    for i in 1..parts.len() {
-        let is_current = parts[i].contains('*');
-        let rate_str = parts[i].trim_end_matches('+').trim_end_matches('*');
-        if let Ok(rate) = rate_str.parse::<f32>() {
-            let mode_string = format!("{}@{:.2}", resolution, rate);
-
-            log::debug!("Parsed X11 mode: {} @ {:.2}Hz", resolution, rate);
-
-            let (width_str, height_str) = resolution.split_once('x')?;
-            let width = width_str.parse::<u32>().ok()?;
-            let height = height_str.parse::<u32>().ok()?;
-
-            return Some(DisplayMode {
-                mode_string,
+            Some(DisplayMode {
+                mode_string: format!("{}@{:.2}", resolution, refresh_rate),
                 resolution: (width, height),
-                refresh_rate: rate,
+                refresh_rate,
                 has_vrr: false, // X11 doesn't report VRR in mode strings
-                is_current,
-            });
-        }
+                is_current: token.contains('*'),
+            })
+        })
+        .filter(|mode| mode.refresh_rate > 10.0)
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Real `xrandr --query` layout.
+    const QUERY: &str = "\
+Screen 0: minimum 16 x 16, current 2560 x 1600, maximum 32767 x 32767
+HDMI-1 disconnected (normal left inverted right x axis y axis)
+eDP-1 connected primary 2560x1600+0+0 (normal left inverted right x axis y axis) 340mm x 220mm
+   2560x1600    240.00*+  165.00    60.00  
+   1920x1200    240.00    60.00  
+DP-2 connected 1920x1080+2560+0 (normal left inverted right x axis y axis) 530mm x 300mm
+   1920x1080     60.00*+
+";
+
+    #[test]
+    fn test_parse_xrandr_output_reads_only_the_builtin_section() {
+        let (name, modes) = parse_xrandr_output(QUERY).expect("built-in found");
+
+        assert_eq!(name, "eDP-1");
+        assert_eq!(modes.len(), 5);
+
+        let current: Vec<_> = modes.iter().filter(|m| m.is_current).collect();
+        assert_eq!(current.len(), 1);
+        assert_eq!(current[0].mode_string, "2560x1600@240.00");
+
+        assert!(modes.iter().all(|m| m.resolution != (1920, 1080)), "DP-2 modes leaked in");
     }
 
-    None
+    #[test]
+    fn test_parse_xrandr_output_ignores_disconnected_builtin() {
+        let query = "eDP-1 disconnected (normal left inverted right x axis y axis)\n";
+
+        assert!(matches!(parse_xrandr_output(query), Err(DisplayError::BuiltinDisplayNotFound)));
+    }
+
+    #[test]
+    fn test_parse_xrandr_mode_line() {
+        let modes = parse_xrandr_mode_line("   2560x1440     59.95*+  165.00");
+
+        assert_eq!(modes.len(), 2);
+        assert_eq!(modes[0].mode_string, "2560x1440@59.95");
+        assert!(modes[0].is_current);
+        assert_eq!(modes[1].refresh_rate, 165.0);
+        assert!(!modes[1].is_current);
+
+        assert!(parse_xrandr_mode_line("not a mode line").is_empty());
+    }
 }
