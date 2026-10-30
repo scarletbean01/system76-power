@@ -15,13 +15,14 @@
 //! - `backend`: one [`DisplayManager`](backend) implementation per display server
 
 mod backend;
+mod command;
 mod detect;
 mod mode;
 mod session;
 
 pub use detect::{DisplayServer, detect_display_server};
 pub use mode::DisplayMode;
-pub use session::{SessionContext, SessionEnv, get_session_context};
+pub use session::{SessionContext, SessionEnv, UserAccount, get_session_context};
 
 use std::io;
 

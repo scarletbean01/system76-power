@@ -5,8 +5,8 @@
 //! GNOME Wayland backend.
 
 use super::{DisplayManager, find_builtin_display_name, is_builtin_display_name};
+use crate::display::command::run_checked;
 use crate::display::mode::ensure_modes_found;
-use crate::display::session::run_command_as_user;
 use crate::display::{DisplayMode, SessionContext};
 use crate::errors::DisplayError;
 
@@ -19,14 +19,7 @@ impl DisplayManager for GnomeManager<'_> {
     fn get_display_info(&self) -> Result<(String, Vec<DisplayMode>), DisplayError> {
         log::debug!("Querying gnome-randr for display info (name + modes)");
 
-        let output = run_command_as_user(self.ctx, "gnome-randr", &["query"])?;
-
-        if !output.status.success() {
-            return Err(DisplayError::CommandFailed {
-                command: "gnome-randr query".to_string(),
-                stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-            });
-        }
+        let output = run_checked(self.ctx, "gnome-randr", &["query"])?;
 
         let stdout = String::from_utf8_lossy(&output.stdout);
 
@@ -72,25 +65,12 @@ impl DisplayManager for GnomeManager<'_> {
     }
 
     fn apply_mode(&self, display_name: &str, mode: &DisplayMode) -> Result<(), DisplayError> {
-        log::debug!(
-            "Executing: sudo -u {} env [vars...] gnome-randr modify {} --mode {}",
-            self.ctx.user,
-            display_name,
-            mode.mode_string
-        );
-        let output = run_command_as_user(
+        run_checked(
             self.ctx,
             "gnome-randr",
             &["modify", display_name, "--mode", &mode.mode_string],
         )?;
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            log::error!("gnome-randr modify failed: {}", stderr);
-            return Err(DisplayError::CommandFailed {
-                command: "gnome-randr modify".to_string(),
-                stderr: stderr.into_owned(),
-            });
-        }
+
         Ok(())
     }
 }

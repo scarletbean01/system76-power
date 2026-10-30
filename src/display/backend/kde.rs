@@ -5,8 +5,8 @@
 //! KDE Wayland backend.
 
 use super::{DisplayManager, is_builtin_display_name};
+use crate::display::command::run_checked;
 use crate::display::mode::ensure_modes_found;
-use crate::display::session::run_command_as_user;
 use crate::display::{DisplayMode, SessionContext};
 use crate::errors::DisplayError;
 
@@ -51,14 +51,7 @@ impl DisplayManager for KdeManager<'_> {
     fn get_display_info(&self) -> Result<(String, Vec<DisplayMode>), DisplayError> {
         log::debug!("Querying kscreen-doctor for display info (name + modes)");
 
-        let output = run_command_as_user(self.ctx, "kscreen-doctor", &["--outputs"])?;
-
-        if !output.status.success() {
-            return Err(DisplayError::CommandFailed {
-                command: "kscreen-doctor --outputs".to_string(),
-                stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-            });
-        }
+        let output = run_checked(self.ctx, "kscreen-doctor", &["--outputs"])?;
 
         let stdout = strip_ansi(&String::from_utf8_lossy(&output.stdout));
         log::debug!("kscreen-doctor output:\n{}", stdout);
@@ -86,23 +79,7 @@ impl DisplayManager for KdeManager<'_> {
         // Also set VRR policy to automatic for high refresh rate modes
         let vrr_arg = format!("output.{}.vrrpolicy.automatic", display_name);
 
-        log::debug!(
-            "Executing: sudo -u {} env [vars...] kscreen-doctor {} {}",
-            self.ctx.user,
-            mode_arg,
-            vrr_arg
-        );
-
-        let output = run_command_as_user(self.ctx, "kscreen-doctor", &[&mode_arg, &vrr_arg])?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            log::error!("kscreen-doctor command failed: {}", stderr);
-            return Err(DisplayError::CommandFailed {
-                command: "kscreen-doctor".to_string(),
-                stderr: stderr.into_owned(),
-            });
-        }
+        run_checked(self.ctx, "kscreen-doctor", &[&mode_arg, &vrr_arg])?;
 
         log::info!(
             "Successfully applied mode {}x{}@{}Hz with VRR policy automatic",

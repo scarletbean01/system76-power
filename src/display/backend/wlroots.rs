@@ -5,8 +5,8 @@
 //! wlroots Wayland backend.
 
 use super::{DisplayManager, is_builtin_display_name};
+use crate::display::command::run_checked;
 use crate::display::mode::ensure_modes_found;
-use crate::display::session::run_command_as_user;
 use crate::display::{DisplayMode, SessionContext};
 use crate::errors::DisplayError;
 
@@ -20,14 +20,7 @@ pub(super) struct WlrootsManager<'a> {
 
 /// Run `wlr-randr --json` and parse the array of outputs.
 fn wlr_randr_outputs(ctx: &SessionContext) -> Result<Vec<serde_json::Value>, DisplayError> {
-    let output = run_command_as_user(ctx, "wlr-randr", &["--json"])?;
-
-    if !output.status.success() {
-        return Err(DisplayError::CommandFailed {
-            command: "wlr-randr --json".to_string(),
-            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-        });
-    }
+    let output = run_checked(ctx, "wlr-randr", &["--json"])?;
 
     serde_json::from_slice(&output.stdout).map_err(|e| DisplayError::CommandFailed {
         command: "wlr-randr --json (parse)".to_string(),
@@ -88,29 +81,13 @@ impl DisplayManager for WlrootsManager<'_> {
     }
 
     fn apply_mode(&self, display_name: &str, mode: &DisplayMode) -> Result<(), DisplayError> {
-        log::debug!(
-            "Executing: sudo -u {} env [vars...] wlr-randr --output {} --mode {}",
-            self.ctx.user,
-            display_name,
-            mode.mode_string
-        );
-
         // wlr-randr waits for the compositor to accept or reject the
         // configuration and exits non-zero on rejection.
-        let output = run_command_as_user(
+        run_checked(
             self.ctx,
             "wlr-randr",
             &["--output", display_name, "--mode", &mode.mode_string],
         )?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            log::error!("wlr-randr failed: {}", stderr);
-            return Err(DisplayError::CommandFailed {
-                command: "wlr-randr".to_string(),
-                stderr: stderr.into_owned(),
-            });
-        }
 
         log::info!("Successfully applied mode {} to {}", mode.mode_string, display_name);
 

@@ -7,6 +7,7 @@
 
 use std::collections::BTreeMap;
 use std::io;
+use std::path::PathBuf;
 use std::process::Command;
 
 use crate::errors::DisplayError;
@@ -117,11 +118,46 @@ struct SessionInfo {
     state: Option<String>,
 }
 
+/// The account owning the graphical session.
+#[derive(Debug, Clone)]
+pub struct UserAccount {
+    pub name: String,
+    pub uid: u32,
+    pub gid: u32,
+    pub home: PathBuf,
+}
+
+impl UserAccount {
+    /// Look the account up in the system user database (honours NSS, not just `/etc/passwd`).
+    pub(super) fn lookup(name: &str) -> Result<Self, DisplayError> {
+        let output = Command::new("getent").arg("passwd").arg(name).output()?;
+
+        output
+            .status
+            .success()
+            .then(|| Self::parse_passwd_entry(&String::from_utf8_lossy(&output.stdout)))
+            .flatten()
+            .ok_or_else(|| DisplayError::UserNotFound(name.to_string()))
+    }
+
+    /// Parse a `name:password:uid:gid:gecos:home:shell` line.
+    fn parse_passwd_entry(line: &str) -> Option<Self> {
+        let mut fields = line.trim().split(':');
+
+        let name = fields.next()?.to_string();
+        let uid = fields.nth(1)?.parse().ok()?;
+        let gid = fields.next()?.parse().ok()?;
+        let home = fields.nth(1)?.into();
+
+        Some(Self { name, uid, gid, home })
+    }
+}
+
 /// Session context containing user and environment variables
 /// This is fetched once and passed to all helper functions to avoid redundant lookups
 #[derive(Debug, Clone)]
 pub struct SessionContext {
-    pub user: String,
+    pub account: UserAccount,
     pub env: SessionEnv,
 }
 
@@ -190,7 +226,7 @@ fn is_primary_seat(session: &SessionInfo) -> bool {
 }
 
 /// Get the username running the active graphical session
-pub(super) fn get_display_user() -> Result<String, io::Error> {
+fn get_display_user() -> Result<String, io::Error> {
     log::debug!("Detecting display user");
 
     // Method 1: Check SUDO_USER environment variable (when run via sudo)
@@ -381,7 +417,8 @@ fn read_process_environment(pid: &str) -> Result<SessionEnv, io::Error> {
 }
 
 /// Get the display environment of the user session
-pub(super) fn get_user_session_env(user: &str) -> Result<SessionEnv, io::Error> {
+pub(super) fn get_user_session_env(account: &UserAccount) -> Result<SessionEnv, io::Error> {
+    let user = account.name.as_str();
     log::info!("Getting session environment for user: {}", user);
 
     // Strategy 1: Find compositor process (most reliable for display environment)
@@ -389,7 +426,7 @@ pub(super) fn get_user_session_env(user: &str) -> Result<SessionEnv, io::Error> 
         let mut env = read_process_environment(&pid)?;
 
         if !env.is_empty() {
-            complete_session_env(user, &mut env);
+            complete_session_env(account, &mut env);
             return Ok(env);
         }
 
@@ -408,14 +445,14 @@ pub(super) fn get_user_session_env(user: &str) -> Result<SessionEnv, io::Error> 
         ));
     }
 
-    complete_session_env(user, &mut env);
+    complete_session_env(account, &mut env);
     Ok(env)
 }
 
 /// Add the variables a compositor exports to its children only, and which
 /// therefore never appear in the compositor process's own environment.
-fn complete_session_env(user: &str, env: &mut SessionEnv) {
-    add_hyprland_signature(user, env);
+fn complete_session_env(account: &UserAccount, env: &mut SessionEnv) {
+    add_hyprland_signature(account, env);
     add_wayland_display(env);
 }
 
@@ -460,31 +497,17 @@ fn discover_wayland_display(env: &SessionEnv) -> Option<String> {
 pub fn get_session_context() -> Result<SessionContext, DisplayError> {
     log::info!("=== Fetching Session Context (once) ===");
 
-    let user = get_display_user()?;
-    let env = get_user_session_env(&user)?;
+    let account = get_display_account()?;
+    let env = get_user_session_env(&account)?;
 
-    log::info!("Session context ready: user={}, env_vars={}", user, env.len());
+    log::info!("Session context ready: user={}, env_vars={}", account.name, env.len());
 
-    Ok(SessionContext { user, env })
+    Ok(SessionContext { account, env })
 }
 
-/// Run an external program as the session user, injecting the session environment
-///
-/// Builds: `sudo -u <user> env KEY=VALUE... <program> [args...]`
-/// This is the single canonical way to invoke display tools (gnome-randr, xrandr)
-/// from a privileged daemon context.
-pub(super) fn run_command_as_user(
-    ctx: &SessionContext,
-    program: &str,
-    args: &[&str],
-) -> Result<std::process::Output, io::Error> {
-    let mut cmd = Command::new("sudo");
-    cmd.arg("-u").arg(&ctx.user).arg("env");
-    for (key, value) in ctx.env.iter() {
-        cmd.arg(format!("{}={}", key, value));
-    }
-    cmd.arg(program).args(args);
-    cmd.output()
+/// Get the account running the active graphical session.
+pub(super) fn get_display_account() -> Result<UserAccount, DisplayError> {
+    UserAccount::lookup(&get_display_user()?)
 }
 
 #[cfg(test)]
@@ -500,5 +523,23 @@ mod tests {
         assert_eq!(env.get("XDG_SESSION_TYPE"), Some("wayland"));
         assert_eq!(env.get("DISPLAY"), Some(":0"));
         assert!(!env.contains("PATH"));
+    }
+
+    #[test]
+    fn test_parse_passwd_entry() {
+        let account = UserAccount::parse_passwd_entry(
+            "deplague:x:1000:985:Dep:/home/deplague:/usr/bin/fish\n",
+        )
+        .expect("valid entry");
+
+        assert_eq!(account.name, "deplague");
+        assert_eq!(account.uid, 1000);
+        assert_eq!(account.gid, 985);
+        assert_eq!(account.home, PathBuf::from("/home/deplague"));
+
+        assert!(
+            UserAccount::parse_passwd_entry("deplague:x:notanumber:985::/home:/bin/sh").is_none()
+        );
+        assert!(UserAccount::parse_passwd_entry("").is_none());
     }
 }

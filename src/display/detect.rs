@@ -4,7 +4,7 @@
 
 //! Display server detection from a session environment.
 
-use super::session::{SessionEnv, get_display_user, get_user_session_env};
+use super::session::{SessionEnv, get_display_account, get_user_session_env};
 
 /// Display server types
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -59,10 +59,10 @@ pub fn detect_display_server() -> DisplayServer {
 fn detect_from_user_session() -> Option<DisplayServer> {
     log::debug!("Attempting to detect display server from user session");
 
-    let user = get_display_user()
+    let account = get_display_account()
         .inspect_err(|e| log::debug!("Failed to get display user: {}", e))
         .ok()?;
-    let env = get_user_session_env(&user)
+    let env = get_user_session_env(&account)
         .inspect_err(|e| log::debug!("Failed to get user session environment: {}", e))
         .ok()?;
 

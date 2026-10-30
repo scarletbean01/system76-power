@@ -5,8 +5,8 @@
 //! X11 backend.
 
 use super::{DisplayManager, find_builtin_display_name, is_builtin_display_name};
+use crate::display::command::run_checked;
 use crate::display::mode::ensure_modes_found;
-use crate::display::session::run_command_as_user;
 use crate::display::{DisplayMode, SessionContext};
 use crate::errors::DisplayError;
 
@@ -19,14 +19,7 @@ impl DisplayManager for X11Manager<'_> {
     fn get_display_info(&self) -> Result<(String, Vec<DisplayMode>), DisplayError> {
         log::debug!("Querying xrandr for display info (name + modes)");
 
-        let output = run_command_as_user(self.ctx, "xrandr", &["--query"])?;
-
-        if !output.status.success() {
-            return Err(DisplayError::CommandFailed {
-                command: "xrandr --query".to_string(),
-                stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-            });
-        }
+        let output = run_checked(self.ctx, "xrandr", &["--query"])?;
 
         let stdout = String::from_utf8_lossy(&output.stdout);
 
@@ -107,15 +100,7 @@ impl DisplayManager for X11Manager<'_> {
     }
 
     fn apply_mode(&self, display_name: &str, mode: &DisplayMode) -> Result<(), DisplayError> {
-        log::debug!(
-            "Executing: sudo -u {} env [vars...] xrandr --output {} --mode {}x{} --rate {:.2}",
-            self.ctx.user,
-            display_name,
-            mode.resolution.0,
-            mode.resolution.1,
-            mode.refresh_rate
-        );
-        let output = run_command_as_user(
+        run_checked(
             self.ctx,
             "xrandr",
             &[
@@ -127,14 +112,7 @@ impl DisplayManager for X11Manager<'_> {
                 &format!("{:.2}", mode.refresh_rate),
             ],
         )?;
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            log::error!("xrandr command failed: {}", stderr);
-            return Err(DisplayError::CommandFailed {
-                command: "xrandr".to_string(),
-                stderr: stderr.into_owned(),
-            });
-        }
+
         Ok(())
     }
 }

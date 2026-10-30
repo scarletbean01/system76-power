@@ -68,6 +68,9 @@ pub enum DisplayError {
     #[error("No active graphical session found")]
     SessionNotFound,
 
+    #[error("Could not look up the account of user '{0}'")]
+    UserNotFound(String),
+
     #[error("No built-in display (eDP/LVDS) found")]
     BuiltinDisplayNotFound,
 

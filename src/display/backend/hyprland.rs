@@ -4,12 +4,11 @@
 
 //! Hyprland backend.
 
-use std::process::Command;
-
 use super::{DisplayManager, is_builtin_display_name};
+use crate::display::command::{failure_text, run_as_user, run_checked};
 use crate::display::mode::ensure_modes_found;
-use crate::display::session::{find_compositor_pid, run_command_as_user};
-use crate::display::{DisplayMode, SessionContext, SessionEnv};
+use crate::display::session::find_compositor_pid;
+use crate::display::{DisplayMode, SessionContext, SessionEnv, UserAccount};
 use crate::errors::DisplayError;
 
 /// Ensure the environment carries `HYPRLAND_INSTANCE_SIGNATURE` when the
@@ -18,28 +17,28 @@ use crate::errors::DisplayError;
 /// `hyprctl` locates its IPC socket via `HYPRLAND_INSTANCE_SIGNATURE`, but the
 /// compositor's own environment (the process we read env vars from) never sets
 /// that variable — it is only exported to Hyprland's children.
-pub(in crate::display) fn add_hyprland_signature(user: &str, env: &mut SessionEnv) {
+pub(in crate::display) fn add_hyprland_signature(account: &UserAccount, env: &mut SessionEnv) {
     if !env.desktop_contains("Hyprland") || env.contains("HYPRLAND_INSTANCE_SIGNATURE") {
         return;
     }
 
-    if let Some(signature) = discover_hyprland_signature(user, env) {
+    if let Some(signature) = discover_hyprland_signature(account, env) {
         log::debug!("Discovered HYPRLAND_INSTANCE_SIGNATURE: {}", signature);
         env.insert("HYPRLAND_INSTANCE_SIGNATURE", signature);
     }
 }
 
-/// Find the signature of the active Hyprland instance for `user`.
+/// Find the signature of the active Hyprland instance of `account`.
 ///
 /// Asks `hyprctl instances -j`, which works without `HYPRLAND_INSTANCE_SIGNATURE`
 /// set, and picks the instance whose PID matches the user's compositor process.
 /// Falls back to the single instance directory under `/run/user/<uid>/hypr/`
 /// when `hyprctl` is unavailable; stale directories from crashed sessions rule
 /// that fallback out, so it is only a last resort.
-fn discover_hyprland_signature(user: &str, env: &SessionEnv) -> Option<String> {
-    let ctx = SessionContext { user: user.to_string(), env: env.clone() };
+fn discover_hyprland_signature(account: &UserAccount, env: &SessionEnv) -> Option<String> {
+    let ctx = SessionContext { account: account.clone(), env: env.clone() };
 
-    if let Ok(output) = run_command_as_user(&ctx, "hyprctl", &["instances", "-j"]) {
+    if let Ok(output) = run_as_user(&ctx, "hyprctl", &["instances", "-j"]) {
         if output.status.success() {
             match serde_json::from_slice::<Vec<serde_json::Value>>(&output.stdout) {
                 Ok(instances) => {
@@ -52,7 +51,7 @@ fn discover_hyprland_signature(user: &str, env: &SessionEnv) -> Option<String> {
                     // Multiple instances (e.g. one left over from a crashed
                     // session): identify ours by the compositor PID.
                     let compositor_pid =
-                        find_compositor_pid(user).and_then(|pid| pid.parse::<u64>().ok());
+                        find_compositor_pid(&account.name).and_then(|pid| pid.parse::<u64>().ok());
 
                     if let Some(pid) = compositor_pid {
                         if let Some(sig) = instances
@@ -72,18 +71,11 @@ fn discover_hyprland_signature(user: &str, env: &SessionEnv) -> Option<String> {
                 Err(e) => log::debug!("Failed to parse 'hyprctl instances -j': {}", e),
             }
         } else {
-            log::debug!("hyprctl instances failed: {}", hyprctl_error_text(&output));
+            log::debug!("hyprctl instances failed: {}", failure_text(&output));
         }
     }
 
-    let output = Command::new("id").arg("-u").arg(user).output().ok()?;
-
-    if !output.status.success() {
-        return None;
-    }
-
-    let uid = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    let mut entries = std::fs::read_dir(format!("/run/user/{}/hypr", uid))
+    let mut entries = std::fs::read_dir(format!("/run/user/{}/hypr", account.uid))
         .ok()?
         .filter_map(|e| e.ok())
         .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
@@ -102,29 +94,9 @@ pub(super) struct HyprlandManager<'a> {
     pub(super) ctx: &'a SessionContext,
 }
 
-/// Extract the diagnostic text from a failed `hyprctl` invocation.
-///
-/// `hyprctl` prints errors (`HYPRLAND_INSTANCE_SIGNATURE not set!`, Lua errors, …)
-/// to **stdout** and leaves stderr empty, so `stderr` alone loses the message.
-fn hyprctl_error_text(output: &std::process::Output) -> String {
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    if !stderr.trim().is_empty() {
-        return stderr.into_owned();
-    }
-
-    String::from_utf8_lossy(&output.stdout).trim().to_string()
-}
-
 /// Run `hyprctl monitors all -j` and parse the JSON array.
 fn hyprctl_monitors(ctx: &SessionContext) -> Result<Vec<serde_json::Value>, DisplayError> {
-    let output = run_command_as_user(ctx, "hyprctl", &["monitors", "all", "-j"])?;
-
-    if !output.status.success() {
-        return Err(DisplayError::CommandFailed {
-            command: "hyprctl monitors all -j".to_string(),
-            stderr: hyprctl_error_text(&output),
-        });
-    }
+    let output = run_checked(ctx, "hyprctl", &["monitors", "all", "-j"])?;
 
     let stdout = String::from_utf8_lossy(&output.stdout);
 
@@ -234,25 +206,28 @@ impl DisplayManager for HyprlandManager<'_> {
             format_scale(scale)
         );
 
-        log::debug!("Executing: sudo -u {} env [vars...] hyprctl eval '{}'", self.ctx.user, lua);
-
         // Keep every attempt's diagnostic so a failed verification can explain itself.
         let mut attempt_errors = String::new();
 
-        let eval_output = run_command_as_user(self.ctx, "hyprctl", &["eval", &lua])?;
+        if let Err(eval_failure) = run_checked(self.ctx, "hyprctl", &["eval", &lua]) {
+            let DisplayError::CommandFailed { stderr: eval_error, .. } = eval_failure else {
+                return Err(eval_failure);
+            };
 
-        if !eval_output.status.success() {
-            let eval_error = hyprctl_error_text(&eval_output);
             log::debug!("hyprctl eval failed ({}), falling back to keyword monitor", eval_error);
             attempt_errors.push_str(&format!("eval: {}; ", eval_error));
 
             let rule = format!("{},{},{}x{},{}", display_name, mode_arg, x, y, format_scale(scale));
-            let keyword_output =
-                run_command_as_user(self.ctx, "hyprctl", &["keyword", "monitor", &rule])?;
 
-            if !keyword_output.status.success() {
-                attempt_errors
-                    .push_str(&format!("keyword: {}", hyprctl_error_text(&keyword_output)));
+            if let Err(keyword_failure) =
+                run_checked(self.ctx, "hyprctl", &["keyword", "monitor", &rule])
+            {
+                let DisplayError::CommandFailed { stderr: keyword_error, .. } = keyword_failure
+                else {
+                    return Err(keyword_failure);
+                };
+
+                attempt_errors.push_str(&format!("keyword: {}", keyword_error));
                 log::error!("hyprctl apply failed: {}", attempt_errors);
                 return Err(DisplayError::CommandFailed {
                     command: "hyprctl eval hl.monitor".to_string(),
@@ -360,23 +335,5 @@ mod tests {
         assert_eq!(format_scale(1.0), "1");
         assert_eq!(format_scale(2.0), "2");
         assert_eq!(format_scale(1.0 / 3.0), "0.333333");
-    }
-
-    /// `hyprctl` reports errors on stdout; the message must not be lost.
-    #[test]
-    fn test_hyprctl_error_text_falls_back_to_stdout() {
-        use std::os::unix::process::ExitStatusExt;
-
-        let failed = |stdout: &str, stderr: &str| std::process::Output {
-            status: std::process::ExitStatus::from_raw(1 << 8),
-            stdout: stdout.as_bytes().to_vec(),
-            stderr: stderr.as_bytes().to_vec(),
-        };
-
-        assert_eq!(
-            hyprctl_error_text(&failed("HYPRLAND_INSTANCE_SIGNATURE not set!", "")),
-            "HYPRLAND_INSTANCE_SIGNATURE not set!"
-        );
-        assert_eq!(hyprctl_error_text(&failed("ignored", "real error")), "real error");
     }
 }
