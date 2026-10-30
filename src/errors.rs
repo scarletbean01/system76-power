@@ -68,6 +68,9 @@ pub enum DisplayError {
     #[error("No active graphical session found")]
     SessionNotFound,
 
+    #[error("No built-in display (eDP/LVDS) found")]
+    BuiltinDisplayNotFound,
+
     #[error("Command '{command}' failed: {stderr}")]
     CommandFailed { command: String, stderr: String },
 

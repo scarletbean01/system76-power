@@ -5,9 +5,11 @@
 //! Display refresh rate management
 //!
 //! This module provides functionality to control display refresh rates based on
-//! power profiles. It supports GNOME Wayland (via gnome-randr) and can be extended
-//! to support other display servers.
+//! power profiles. It supports GNOME Wayland (via gnome-randr), KDE Wayland
+//! (kscreen-doctor), Hyprland (hyprctl), other wlroots compositors such as
+//! Mango (wlr-randr) and X11 (xrandr).
 
+use std::collections::BTreeMap;
 use std::io;
 use std::process::Command;
 
@@ -26,6 +28,7 @@ const COMPOSITOR_PROCESSES: &[&str] = &[
     "labwc",        // labwc
     "river",        // River
     "dwl",          // dwl
+    "mango",        // MangoWM
     "Xorg",         // X11 server (fallback)
 ];
 
@@ -57,6 +60,71 @@ pub struct DisplayMode {
     pub is_current: bool,
 }
 
+/// Display-related environment variables of a user session.
+///
+/// Only the variables listed in [`SESSION_ENV_VARS`] (plus ones we discover
+/// ourselves, such as `WAYLAND_DISPLAY`) are stored.
+#[derive(Debug, Clone, Default)]
+pub struct SessionEnv(BTreeMap<String, String>);
+
+impl SessionEnv {
+    /// Collect the session variables from this process's own environment.
+    pub fn from_process() -> Self {
+        SESSION_ENV_VARS
+            .iter()
+            .filter_map(|&key| std::env::var(key).ok().map(|value| (key.to_string(), value)))
+            .collect()
+    }
+
+    /// Parse a NUL-separated `/proc/<pid>/environ` block, keeping session variables only.
+    fn from_environ_block(block: &[u8]) -> Self {
+        block
+            .split(|&byte| byte == 0)
+            .filter_map(|entry| std::str::from_utf8(entry).ok()?.split_once('='))
+            .filter(|(key, _)| SESSION_ENV_VARS.contains(key))
+            .map(|(key, value)| (key.to_string(), value.to_string()))
+            .collect()
+    }
+
+    pub fn get(&self, key: &str) -> Option<&str> {
+        self.0.get(key).map(String::as_str)
+    }
+
+    pub fn contains(&self, key: &str) -> bool {
+        self.0.contains_key(key)
+    }
+
+    pub fn insert(&mut self, key: &str, value: impl Into<String>) {
+        self.0.insert(key.to_string(), value.into());
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (&str, &str)> + '_ {
+        self.0.iter().map(|(key, value)| (key.as_str(), value.as_str()))
+    }
+
+    fn is_wayland_session(&self) -> bool {
+        self.get("XDG_SESSION_TYPE") == Some("wayland")
+    }
+
+    fn desktop_contains(&self, name: &str) -> bool {
+        self.get("XDG_CURRENT_DESKTOP").is_some_and(|desktop| desktop.contains(name))
+    }
+}
+
+impl FromIterator<(String, String)> for SessionEnv {
+    fn from_iter<I: IntoIterator<Item = (String, String)>>(iter: I) -> Self {
+        Self(iter.into_iter().collect())
+    }
+}
+
 /// Display server types
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DisplayServer {
@@ -68,157 +136,56 @@ pub enum DisplayServer {
     Unknown,
 }
 
+impl DisplayServer {
+    /// Wayland desktops with a dedicated backend, matched against `XDG_CURRENT_DESKTOP`.
+    const WAYLAND_DESKTOPS: &'static [(&'static str, DisplayServer)] =
+        &[("GNOME", Self::GnomeWayland), ("KDE", Self::KdeWayland), ("Hyprland", Self::Hyprland)];
+
+    /// Detect the display server a session environment belongs to.
+    pub fn detect(env: &SessionEnv) -> Option<Self> {
+        log::debug!("Detecting display server from {:?}", env);
+
+        // The compositor's own environment never carries WAYLAND_DISPLAY (it only
+        // exports it to its children), so the session type is the reliable signal.
+        if env.is_wayland_session() {
+            let desktop = Self::WAYLAND_DESKTOPS
+                .iter()
+                .find(|(name, _)| env.desktop_contains(name))
+                .map(|&(_, server)| server);
+
+            return Some(desktop.unwrap_or(Self::Wayland));
+        }
+
+        if env.contains("WAYLAND_DISPLAY") {
+            return Some(Self::Wayland);
+        }
+
+        env.contains("DISPLAY").then_some(Self::X11)
+    }
+}
+
 /// Detect which display server is currently running
 pub fn detect_display_server() -> DisplayServer {
-    // First, try to get environment from the current process (works for direct invocation)
-    if let Some(server) = detect_from_env() {
-        return server;
-    }
-
-    // If running as a system service, query the user session environment
-    if let Some(server) = detect_from_user_session() {
-        return server;
-    }
-
-    DisplayServer::Unknown
+    // Direct invocation: this process carries the session environment.
+    DisplayServer::detect(&SessionEnv::from_process())
+        // System service: query the user session environment instead.
+        .or_else(detect_from_user_session)
+        .unwrap_or(DisplayServer::Unknown)
 }
 
-/// Detect display server from current process environment variables
-fn detect_from_env() -> Option<DisplayServer> {
-    let session_type = std::env::var("XDG_SESSION_TYPE").ok();
-    let current_desktop = std::env::var("XDG_CURRENT_DESKTOP").ok();
-    let wayland_display = std::env::var("WAYLAND_DISPLAY").ok();
-    let x11_display = std::env::var("DISPLAY").ok();
-
-    // Check for GNOME Wayland specifically
-    if session_type.as_deref() == Some("wayland")
-        && current_desktop.as_ref().map(|d| d.contains("GNOME")).unwrap_or(false)
-    {
-        log::debug!("Detected GNOME Wayland from process environment");
-        return Some(DisplayServer::GnomeWayland);
-    }
-
-    // Check for KDE Wayland specifically
-    if session_type.as_deref() == Some("wayland")
-        && current_desktop.as_ref().map(|d| d.contains("KDE")).unwrap_or(false)
-    {
-        log::debug!("Detected KDE Wayland from process environment");
-        return Some(DisplayServer::KdeWayland);
-    }
-
-    // Check for Hyprland specifically
-    if session_type.as_deref() == Some("wayland")
-        && current_desktop.as_ref().map(|d| d.contains("Hyprland")).unwrap_or(false)
-    {
-        log::debug!("Detected Hyprland from process environment");
-        return Some(DisplayServer::Hyprland);
-    }
-
-    // Check for other Wayland compositors
-    if wayland_display.is_some() {
-        log::debug!("Detected Wayland from process environment");
-        return Some(DisplayServer::Wayland);
-    }
-
-    // Check for X11
-    if x11_display.is_some() {
-        log::debug!("Detected X11 from process environment");
-        return Some(DisplayServer::X11);
-    }
-
-    None
-}
-
-/// Detect display server from user session environment
+/// Detect display server from the user session environment
 /// This is used when running as a system service without access to session variables
 fn detect_from_user_session() -> Option<DisplayServer> {
     log::debug!("Attempting to detect display server from user session");
 
-    // Get the display user
-    let user = match get_display_user() {
-        Ok(u) => u,
-        Err(e) => {
-            log::debug!("Failed to get display user: {}", e);
-            return None;
-        }
-    };
+    let user = get_display_user()
+        .inspect_err(|e| log::debug!("Failed to get display user: {}", e))
+        .ok()?;
+    let env = get_user_session_env(&user)
+        .inspect_err(|e| log::debug!("Failed to get user session environment: {}", e))
+        .ok()?;
 
-    // Get environment variables from user session
-    let env_vars = match get_user_session_env(&user) {
-        Ok(vars) => vars,
-        Err(e) => {
-            log::debug!("Failed to get user session environment: {}", e);
-            return None;
-        }
-    };
-
-    detect_server_from_env_vars(&env_vars)
-}
-
-/// Detect display server from environment variables
-/// Helper function that can work with both current process env and session env
-fn detect_server_from_env_vars(env_vars: &[(String, String)]) -> Option<DisplayServer> {
-    let mut session_type = None;
-    let mut current_desktop = None;
-    let mut wayland_display = None;
-    let mut x11_display = None;
-
-    // Parse environment variables
-    for (key, value) in env_vars {
-        match key.as_str() {
-            "XDG_SESSION_TYPE" => session_type = Some(value.clone()),
-            "XDG_CURRENT_DESKTOP" => current_desktop = Some(value.clone()),
-            "WAYLAND_DISPLAY" => wayland_display = Some(value.clone()),
-            "DISPLAY" => x11_display = Some(value.clone()),
-            _ => {}
-        }
-    }
-
-    log::debug!(
-        "Environment variables: session_type={:?}, desktop={:?}, wayland={:?}, x11={:?}",
-        session_type,
-        current_desktop,
-        wayland_display,
-        x11_display
-    );
-
-    // Check for GNOME Wayland specifically
-    if session_type.as_deref() == Some("wayland")
-        && current_desktop.as_ref().map(|d| d.contains("GNOME")).unwrap_or(false)
-    {
-        log::debug!("Detected GNOME Wayland");
-        return Some(DisplayServer::GnomeWayland);
-    }
-
-    // Check for KDE Wayland specifically
-    if session_type.as_deref() == Some("wayland")
-        && current_desktop.as_ref().map(|d| d.contains("KDE")).unwrap_or(false)
-    {
-        log::debug!("Detected KDE Wayland");
-        return Some(DisplayServer::KdeWayland);
-    }
-
-    // Check for Hyprland specifically
-    if session_type.as_deref() == Some("wayland")
-        && current_desktop.as_ref().map(|d| d.contains("Hyprland")).unwrap_or(false)
-    {
-        log::debug!("Detected Hyprland");
-        return Some(DisplayServer::Hyprland);
-    }
-
-    // Check for other Wayland compositors
-    if wayland_display.is_some() {
-        log::debug!("Detected Wayland");
-        return Some(DisplayServer::Wayland);
-    }
-
-    // Check for X11
-    if x11_display.is_some() {
-        log::debug!("Detected X11");
-        return Some(DisplayServer::X11);
-    }
-
-    None
+    DisplayServer::detect(&env)
 }
 
 /// Session information from loginctl
@@ -236,7 +203,7 @@ struct SessionInfo {
 #[derive(Debug, Clone)]
 pub struct SessionContext {
     pub user: String,
-    pub env_vars: Vec<(String, String)>,
+    pub env: SessionEnv,
 }
 
 /// Query detailed information about a specific session
@@ -472,49 +439,39 @@ fn find_session_leader_pid(user: &str) -> Result<String, io::Error> {
     ))
 }
 
-/// Read environment variables from /proc/<pid>/environ
-fn read_process_environment(pid: &str) -> Result<Vec<(String, String)>, io::Error> {
+/// Read the session environment variables from /proc/<pid>/environ
+fn read_process_environment(pid: &str) -> Result<SessionEnv, io::Error> {
     log::debug!("Reading environment from PID: {}", pid);
 
     let environ_path = format!("/proc/{}/environ", pid);
     let environ_data = std::fs::read(&environ_path)
         .map_err(|e| io::Error::new(e.kind(), format!("Failed to read {}: {}", environ_path, e)))?;
 
-    let mut env_vars = Vec::new();
+    let env = SessionEnv::from_environ_block(&environ_data);
 
-    // Parse null-separated environment variables
-    for entry in environ_data.split(|&b| b == 0) {
-        if let Ok(env_str) = std::str::from_utf8(entry) {
-            if let Some((key, value)) = env_str.split_once('=') {
-                // Check if this is a session environment variable we care about
-                if SESSION_ENV_VARS.contains(&key) {
-                    env_vars.push((key.to_string(), value.to_string()));
-                    log::debug!("Found env: {}={}", key, value);
-                }
-            }
-        }
-    }
-
-    if env_vars.is_empty() {
+    if env.is_empty() {
         log::warn!("No display environment variables found in PID {}", pid);
     } else {
-        log::info!("Extracted {} environment variables from PID {}", env_vars.len(), pid);
+        for (key, value) in env.iter() {
+            log::debug!("Found env: {}={}", key, value);
+        }
+        log::info!("Extracted {} environment variables from PID {}", env.len(), pid);
     }
 
-    Ok(env_vars)
+    Ok(env)
 }
 
-/// Get environment variables from the user session
-/// Returns a vector of (key, value) tuples for relevant display environment variables
-fn get_user_session_env(user: &str) -> Result<Vec<(String, String)>, io::Error> {
+/// Get the display environment of the user session
+fn get_user_session_env(user: &str) -> Result<SessionEnv, io::Error> {
     log::info!("Getting session environment for user: {}", user);
 
     // Strategy 1: Find compositor process (most reliable for display environment)
     if let Some(pid) = find_compositor_pid(user) {
-        let env_vars = read_process_environment(&pid)?;
+        let mut env = read_process_environment(&pid)?;
 
-        if !env_vars.is_empty() {
-            return Ok(with_hyprland_signature(user, env_vars));
+        if !env.is_empty() {
+            complete_session_env(user, &mut env);
+            return Ok(env);
         }
 
         log::warn!("Compositor PID {} had no display environment, trying fallback", pid);
@@ -523,16 +480,60 @@ fn get_user_session_env(user: &str) -> Result<Vec<(String, String)>, io::Error> 
     // Strategy 2: Use session leader (fallback)
     log::debug!("Falling back to session leader PID");
     let pid = find_session_leader_pid(user)?;
-    let env_vars = read_process_environment(&pid)?;
+    let mut env = read_process_environment(&pid)?;
 
-    if env_vars.is_empty() {
+    if env.is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
             format!("No display environment variables found for user {}", user),
         ));
     }
 
-    Ok(with_hyprland_signature(user, env_vars))
+    complete_session_env(user, &mut env);
+    Ok(env)
+}
+
+/// Add the variables a compositor exports to its children only, and which
+/// therefore never appear in the compositor process's own environment.
+fn complete_session_env(user: &str, env: &mut SessionEnv) {
+    add_hyprland_signature(user, env);
+    add_wayland_display(env);
+}
+
+/// Ensure the environment carries `WAYLAND_DISPLAY` on Wayland sessions.
+///
+/// Wayland clients (e.g. `wlr-randr`) need it to find the compositor socket,
+/// so look it up in the runtime dir.
+fn add_wayland_display(env: &mut SessionEnv) {
+    if !env.is_wayland_session() || env.contains("WAYLAND_DISPLAY") {
+        return;
+    }
+
+    match discover_wayland_display(env) {
+        Some(display) => {
+            log::debug!("Discovered WAYLAND_DISPLAY: {}", display);
+            env.insert("WAYLAND_DISPLAY", display);
+        }
+        None => log::warn!("Wayland session but no compositor socket found in XDG_RUNTIME_DIR"),
+    }
+}
+
+/// Find the Wayland socket (`wayland-N`) in the session's `XDG_RUNTIME_DIR`.
+///
+/// Nested compositors create additional sockets; the lowest-numbered one
+/// belongs to the session's own compositor.
+fn discover_wayland_display(env: &SessionEnv) -> Option<String> {
+    use std::os::unix::fs::FileTypeExt;
+
+    let runtime_dir = env.get("XDG_RUNTIME_DIR")?;
+
+    std::fs::read_dir(runtime_dir)
+        .ok()?
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_socket()))
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with("wayland-"))
+        .min()
 }
 
 /// Ensure the environment carries `HYPRLAND_INSTANCE_SIGNATURE` when the
@@ -541,26 +542,15 @@ fn get_user_session_env(user: &str) -> Result<Vec<(String, String)>, io::Error> 
 /// `hyprctl` locates its IPC socket via `HYPRLAND_INSTANCE_SIGNATURE`, but the
 /// compositor's own environment (the process we read env vars from) never sets
 /// that variable — it is only exported to Hyprland's children.
-fn with_hyprland_signature(
-    user: &str,
-    mut env_vars: Vec<(String, String)>,
-) -> Vec<(String, String)> {
-    let is_hyprland =
-        env_vars.iter().any(|(k, v)| k == "XDG_CURRENT_DESKTOP" && v.contains("Hyprland"));
-
-    if !is_hyprland || env_vars.iter().any(|(k, _)| k == "HYPRLAND_INSTANCE_SIGNATURE") {
-        return env_vars;
+fn add_hyprland_signature(user: &str, env: &mut SessionEnv) {
+    if !env.desktop_contains("Hyprland") || env.contains("HYPRLAND_INSTANCE_SIGNATURE") {
+        return;
     }
 
-    // Compute before pushing: `discover` borrows `env_vars` for the sudo env.
-    let signature = discover_hyprland_signature(user, &env_vars);
-
-    if let Some(sig) = signature {
-        log::debug!("Discovered HYPRLAND_INSTANCE_SIGNATURE: {}", sig);
-        env_vars.push(("HYPRLAND_INSTANCE_SIGNATURE".to_string(), sig));
+    if let Some(signature) = discover_hyprland_signature(user, env) {
+        log::debug!("Discovered HYPRLAND_INSTANCE_SIGNATURE: {}", signature);
+        env.insert("HYPRLAND_INSTANCE_SIGNATURE", signature);
     }
-
-    env_vars
 }
 
 /// Find the signature of the active Hyprland instance for `user`.
@@ -570,8 +560,8 @@ fn with_hyprland_signature(
 /// Falls back to the single instance directory under `/run/user/<uid>/hypr/`
 /// when `hyprctl` is unavailable; stale directories from crashed sessions rule
 /// that fallback out, so it is only a last resort.
-fn discover_hyprland_signature(user: &str, env_vars: &[(String, String)]) -> Option<String> {
-    let ctx = SessionContext { user: user.to_string(), env_vars: env_vars.to_vec() };
+fn discover_hyprland_signature(user: &str, env: &SessionEnv) -> Option<String> {
+    let ctx = SessionContext { user: user.to_string(), env: env.clone() };
 
     if let Ok(output) = run_command_as_user(&ctx, "hyprctl", &["instances", "-j"]) {
         if output.status.success() {
@@ -633,11 +623,11 @@ pub fn get_session_context() -> Result<SessionContext, DisplayError> {
     log::info!("=== Fetching Session Context (once) ===");
 
     let user = get_display_user()?;
-    let env_vars = get_user_session_env(&user)?;
+    let env = get_user_session_env(&user)?;
 
-    log::info!("Session context ready: user={}, env_vars={}", user, env_vars.len());
+    log::info!("Session context ready: user={}, env_vars={}", user, env.len());
 
-    Ok(SessionContext { user, env_vars })
+    Ok(SessionContext { user, env })
 }
 
 /// Run an external program as the session user, injecting the session environment
@@ -652,7 +642,7 @@ fn run_command_as_user(
 ) -> Result<std::process::Output, io::Error> {
     let mut cmd = Command::new("sudo");
     cmd.arg("-u").arg(&ctx.user).arg("env");
-    for (key, value) in &ctx.env_vars {
+    for (key, value) in ctx.env.iter() {
         cmd.arg(format!("{}={}", key, value));
     }
     cmd.arg(program).args(args);
@@ -696,8 +686,9 @@ impl DisplayManager for GnomeManager<'_> {
         // Find the built-in display name (eDP-*)
         let display_name = find_builtin_display_name(stdout.lines(), |line| {
             let trimmed = line.trim();
-            trimmed.starts_with("eDP") && !trimmed.contains("disconnected")
-        });
+            is_builtin_display_name(trimmed) && !trimmed.contains("disconnected")
+        })
+        .ok_or(DisplayError::BuiltinDisplayNotFound)?;
 
         // Collect modes for the detected display
         let mut modes = Vec::new();
@@ -778,9 +769,11 @@ impl DisplayManager for X11Manager<'_> {
         let stdout = String::from_utf8_lossy(&output.stdout);
 
         // Find the built-in display name (eDP-* or LVDS-*)
+        // The leading space keeps "disconnected" outputs from matching.
         let display_name = find_builtin_display_name(stdout.lines(), |line| {
-            line.contains("connected") && (line.starts_with("eDP") || line.starts_with("LVDS"))
-        });
+            is_builtin_display_name(line) && line.contains(" connected")
+        })
+        .ok_or(DisplayError::BuiltinDisplayNotFound)?;
 
         // Collect modes for the detected display
         let mut modes = Vec::new();
@@ -937,60 +930,8 @@ impl DisplayManager for KdeManager<'_> {
         let stdout = strip_ansi(&String::from_utf8_lossy(&output.stdout));
         log::debug!("kscreen-doctor output:\n{}", stdout);
 
-        // Parse the multi-line output format:
-        // Output: 1 eDP-1 <uuid>
-        //         enabled
-        //         connected
-        //         ...
-        //         Modes:  1:2560x1440@60.00*!  2:2560x1440@165.00  ...
-        //         ...
-        // Output: 2 HDMI-1 <uuid>
-        //         ...
-
-        let mut display_name: Option<String> = None;
-        let mut modes = Vec::new();
-        let mut in_target_display = false;
-
-        for line in stdout.lines() {
-            let trimmed = line.trim();
-
-            // Check if this line contains "Output:" (more flexible matching)
-            if trimmed.contains("Output:") && trimmed.contains("eDP") {
-                // If we were already in the target display section, we're done
-                if in_target_display {
-                    log::debug!("Found next output, stopping search");
-                    break;
-                }
-
-                // Extract the display name - find eDP-* pattern
-                for part in trimmed.split_whitespace() {
-                    if part.starts_with("eDP") || part.starts_with("LVDS") {
-                        log::debug!("Found built-in display: {}", part);
-                        display_name = Some(part.to_string());
-                        in_target_display = true;
-                        break;
-                    }
-                }
-            } else if in_target_display {
-                // We're inside the target display's section (indented lines)
-
-                // Look for the Modes: line (flexible matching)
-                if trimmed.contains("Modes:") {
-                    // Extract everything after "Modes:"
-                    if let Some(modes_idx) = trimmed.find("Modes:") {
-                        let modes_str = &trimmed[modes_idx + 6..];
-                        let modes_str = modes_str.trim();
-                        log::debug!("Found modes line: {}", modes_str);
-                        modes = parse_kscreen_modes(modes_str);
-                    }
-                }
-            }
-        }
-
-        let display_name = display_name.unwrap_or_else(|| {
-            log::warn!("Could not detect built-in display name, using default: eDP-1");
-            "eDP-1".to_string()
-        });
+        let (display_name, modes) =
+            parse_kscreen_builtin_output(&stdout).ok_or(DisplayError::BuiltinDisplayNotFound)?;
 
         log::info!("Found {} available modes for display '{}'", modes.len(), display_name);
 
@@ -1107,16 +1048,16 @@ impl DisplayManager for HyprlandManager<'_> {
         // Prefer the built-in display, fall back to the first monitor.
         let monitor = monitors
             .iter()
-            .find(|m| {
-                m["name"]
-                    .as_str()
-                    .map(|n| n.starts_with("eDP") || n.starts_with("LVDS"))
-                    .unwrap_or(false)
-            })
+            .find(|m| m["name"].as_str().is_some_and(is_builtin_display_name))
             .or_else(|| monitors.first())
             .ok_or(DisplayError::SessionNotFound)?;
 
-        let display_name = monitor["name"].as_str().unwrap_or("eDP-1").to_string();
+        let display_name = monitor["name"]
+            .as_str()
+            .ok_or_else(|| DisplayError::ParseError {
+                command: "hyprctl monitors all -j".to_string(),
+            })?
+            .to_string();
 
         let current_res = (monitor["width"].as_u64(), monitor["height"].as_u64());
         let current_rate = monitor["refreshRate"].as_f64();
@@ -1284,12 +1225,126 @@ fn format_scale(scale: f64) -> String {
     }
 }
 
+/// wlroots Wayland backend — uses `wlr-randr`
+///
+/// Works with any compositor implementing `wlr-output-management` (Mango, sway,
+/// labwc, river, wayfire, dwl, …). Requires the `wlr-randr` package.
+struct WlrootsManager<'a> {
+    ctx: &'a SessionContext,
+}
+
+/// Whether an output name belongs to a laptop's built-in panel (eDP-*, LVDS-*).
+fn is_builtin_display_name(name: &str) -> bool {
+    name.starts_with("eDP") || name.starts_with("LVDS")
+}
+
+/// Run `wlr-randr --json` and parse the array of outputs.
+fn wlr_randr_outputs(ctx: &SessionContext) -> Result<Vec<serde_json::Value>, DisplayError> {
+    let output = run_command_as_user(ctx, "wlr-randr", &["--json"])?;
+
+    if !output.status.success() {
+        return Err(DisplayError::CommandFailed {
+            command: "wlr-randr --json".to_string(),
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        });
+    }
+
+    serde_json::from_slice(&output.stdout).map_err(|e| DisplayError::CommandFailed {
+        command: "wlr-randr --json (parse)".to_string(),
+        stderr: format!("invalid JSON: {}", e),
+    })
+}
+
+/// Pick the enabled built-in output, falling back to the first enabled output.
+fn select_wlr_randr_output(outputs: &[serde_json::Value]) -> Option<&serde_json::Value> {
+    let mut enabled = outputs.iter().filter(|o| o["enabled"].as_bool().unwrap_or(false));
+
+    enabled
+        .clone()
+        .find(|o| o["name"].as_str().is_some_and(is_builtin_display_name))
+        .or_else(|| enabled.next())
+}
+
+/// Parse one entry of an output's `modes` array from `wlr-randr --json`.
+fn parse_wlr_randr_mode(mode: &serde_json::Value) -> Option<DisplayMode> {
+    let width = u32::try_from(mode["width"].as_u64()?).ok()?;
+    let height = u32::try_from(mode["height"].as_u64()?).ok()?;
+    let refresh = mode["refresh"].as_f64()?;
+
+    Some(DisplayMode {
+        // wlr-randr matches the refresh rate exactly, so keep the full precision.
+        mode_string: format!("{}x{}@{:.6}", width, height, refresh),
+        resolution: (width, height),
+        refresh_rate: refresh as f32,
+        has_vrr: false,
+        is_current: mode["current"].as_bool().unwrap_or(false),
+    })
+}
+
+impl DisplayManager for WlrootsManager<'_> {
+    fn get_display_info(&self) -> Result<(String, Vec<DisplayMode>), DisplayError> {
+        log::debug!("Querying wlr-randr for display info (name + modes)");
+
+        let outputs = wlr_randr_outputs(self.ctx)?;
+        let output = select_wlr_randr_output(&outputs).ok_or(DisplayError::SessionNotFound)?;
+
+        let display_name = output["name"]
+            .as_str()
+            .ok_or_else(|| DisplayError::ParseError { command: "wlr-randr --json".to_string() })?
+            .to_string();
+
+        let modes: Vec<DisplayMode> = output["modes"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(parse_wlr_randr_mode)
+            .collect();
+
+        log::info!("Found {} available modes for display '{}'", modes.len(), display_name);
+
+        ensure_modes_found(&modes, &display_name, "wlr-randr", &output.to_string())?;
+
+        Ok((display_name, modes))
+    }
+
+    fn apply_mode(&self, display_name: &str, mode: &DisplayMode) -> Result<(), DisplayError> {
+        log::debug!(
+            "Executing: sudo -u {} env [vars...] wlr-randr --output {} --mode {}",
+            self.ctx.user,
+            display_name,
+            mode.mode_string
+        );
+
+        // wlr-randr waits for the compositor to accept or reject the
+        // configuration and exits non-zero on rejection.
+        let output = run_command_as_user(
+            self.ctx,
+            "wlr-randr",
+            &["--output", display_name, "--mode", &mode.mode_string],
+        )?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            log::error!("wlr-randr failed: {}", stderr);
+            return Err(DisplayError::CommandFailed {
+                command: "wlr-randr".to_string(),
+                stderr: stderr.into_owned(),
+            });
+        }
+
+        log::info!("Successfully applied mode {} to {}", mode.mode_string, display_name);
+
+        Ok(())
+    }
+}
+
 /// Construct the correct `DisplayManager` for the active session.
 ///
-/// Returns an error for unsupported display servers (generic Wayland, Unknown).
+/// Returns an error for display servers that cannot be detected (Unknown).
 fn create_manager(ctx: &SessionContext) -> Result<Box<dyn DisplayManager + '_>, DisplayError> {
-    let display_server = detect_server_from_env_vars(&ctx.env_vars)
-        .unwrap_or_else(|| detect_from_env().unwrap_or(DisplayServer::Unknown));
+    let display_server = DisplayServer::detect(&ctx.env)
+        .or_else(|| DisplayServer::detect(&SessionEnv::from_process()))
+        .unwrap_or(DisplayServer::Unknown);
 
     log::info!("Detected display server: {:?}", display_server);
 
@@ -1311,8 +1366,8 @@ fn create_manager(ctx: &SessionContext) -> Result<Box<dyn DisplayManager + '_>, 
             Ok(Box::new(X11Manager { ctx }))
         }
         DisplayServer::Wayland => {
-            log::error!("Generic Wayland compositor detected - display control not implemented");
-            Err(DisplayError::UnsupportedBackend("Wayland".to_string()))
+            log::info!("Using wlroots backend (wlr-randr)");
+            Ok(Box::new(WlrootsManager { ctx }))
         }
         DisplayServer::Unknown => {
             log::error!("Could not detect display server");
@@ -1324,28 +1379,22 @@ fn create_manager(ctx: &SessionContext) -> Result<Box<dyn DisplayManager + '_>, 
 /// Find the built-in display name from command output lines
 ///
 /// Searches for display names matching common laptop display patterns (eDP-*, LVDS-*).
-/// Returns a default of "eDP-1" if no match is found.
+/// Returns `None` when no built-in display is listed, so callers never act on a guessed name.
 ///
 /// # Arguments
 /// * `lines` - Iterator over output lines from display query command
-/// * `line_filter` - Optional filter function to apply to each line (e.g., check "connected")
-fn find_builtin_display_name<'a, F>(lines: impl Iterator<Item = &'a str>, line_filter: F) -> String
-where
-    F: Fn(&str) -> bool,
-{
-    for line in lines {
-        if !line_filter(line) {
-            continue;
-        }
-        for part in line.split_whitespace() {
-            if part.starts_with("eDP") || part.starts_with("LVDS") {
-                log::debug!("Found built-in display: {}", part);
-                return part.to_string();
-            }
-        }
-    }
-    log::warn!("Could not detect built-in display name, using default: eDP-1");
-    "eDP-1".to_string()
+/// * `line_filter` - Filter function applied to each line (e.g., check "connected")
+fn find_builtin_display_name<'a>(
+    lines: impl Iterator<Item = &'a str>,
+    line_filter: impl Fn(&str) -> bool,
+) -> Option<String> {
+    let name = lines
+        .filter(|line| line_filter(line))
+        .flat_map(str::split_whitespace)
+        .find(|part| is_builtin_display_name(part))?;
+
+    log::debug!("Found built-in display: {}", name);
+    Some(name.to_string())
 }
 
 /// Ensure modes were found, returning an appropriate error if empty
@@ -1458,6 +1507,45 @@ fn parse_xrandr_mode_line(line: &str, resolution: &str) -> Option<DisplayMode> {
     }
 
     None
+}
+
+/// Extract the built-in output's name and modes from `kscreen-doctor --outputs`.
+///
+/// Parses the multi-line output format:
+/// ```text
+/// Output: 1 eDP-1 <uuid>
+///         enabled
+///         Modes:  1:2560x1440@60.00*!  2:2560x1440@165.00  ...
+/// Output: 2 HDMI-1 <uuid>
+///         ...
+/// ```
+/// Returns `None` when no built-in output (eDP-*, LVDS-*) is listed.
+fn parse_kscreen_builtin_output(stdout: &str) -> Option<(String, Vec<DisplayMode>)> {
+    let mut display_name: Option<String> = None;
+    let mut modes = Vec::new();
+
+    for line in stdout.lines() {
+        let trimmed = line.trim();
+
+        if trimmed.contains("Output:") {
+            // Any further output ends the built-in output's section.
+            if display_name.is_some() {
+                break;
+            }
+
+            display_name = trimmed
+                .split_whitespace()
+                .find(|part| is_builtin_display_name(part))
+                .map(str::to_string);
+        } else if display_name.is_some() {
+            if let Some((_, modes_str)) = trimmed.split_once("Modes:") {
+                log::debug!("Found modes line: {}", modes_str.trim());
+                modes = parse_kscreen_modes(modes_str.trim());
+            }
+        }
+    }
+
+    display_name.map(|name| (name, modes))
 }
 
 /// Parse kscreen-doctor mode strings from the Modes: section
@@ -1898,6 +1986,121 @@ mod tests {
 
         assert!(parse_hyprland_mode("2560x1600@240.00").is_none(), "missing Hz suffix");
         assert!(parse_hyprland_mode("garbage").is_none());
+    }
+
+    fn session_env(pairs: &[(&str, &str)]) -> SessionEnv {
+        pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+    }
+
+    /// Mango's own environment (what we read from /proc) has no WAYLAND_DISPLAY,
+    /// only the session type; that must still resolve to a Wayland backend.
+    #[test]
+    fn test_detect_wayland_without_wayland_display() {
+        let mango = session_env(&[
+            ("XDG_SESSION_TYPE", "wayland"),
+            ("XDG_CURRENT_DESKTOP", "mango:wlroots"),
+            ("XDG_RUNTIME_DIR", "/run/user/1000"),
+        ]);
+        assert_eq!(DisplayServer::detect(&mango), Some(DisplayServer::Wayland));
+
+        let tty = session_env(&[("XDG_SESSION_TYPE", "tty")]);
+        assert_eq!(DisplayServer::detect(&tty), None);
+    }
+
+    #[test]
+    fn test_detect_known_desktops_and_x11() {
+        let detect = |pairs: &[(&str, &str)]| DisplayServer::detect(&session_env(pairs));
+
+        assert_eq!(
+            detect(&[("XDG_SESSION_TYPE", "wayland"), ("XDG_CURRENT_DESKTOP", "ubuntu:GNOME")]),
+            Some(DisplayServer::GnomeWayland)
+        );
+        assert_eq!(
+            detect(&[("XDG_SESSION_TYPE", "wayland"), ("XDG_CURRENT_DESKTOP", "KDE")]),
+            Some(DisplayServer::KdeWayland)
+        );
+        assert_eq!(
+            detect(&[("XDG_SESSION_TYPE", "wayland"), ("XDG_CURRENT_DESKTOP", "Hyprland")]),
+            Some(DisplayServer::Hyprland)
+        );
+        // GNOME on X11 is not a Wayland desktop backend.
+        assert_eq!(
+            detect(&[
+                ("XDG_SESSION_TYPE", "x11"),
+                ("XDG_CURRENT_DESKTOP", "GNOME"),
+                ("DISPLAY", ":0")
+            ]),
+            Some(DisplayServer::X11)
+        );
+    }
+
+    #[test]
+    fn test_environ_block_keeps_session_variables_only() {
+        let block = b"PATH=/usr/bin\0XDG_SESSION_TYPE=wayland\0SECRET=x\0DISPLAY=:0\0garbage\0";
+        let env = SessionEnv::from_environ_block(block);
+
+        assert_eq!(env.len(), 2);
+        assert_eq!(env.get("XDG_SESSION_TYPE"), Some("wayland"));
+        assert_eq!(env.get("DISPLAY"), Some(":0"));
+        assert!(!env.contains("PATH"));
+    }
+
+    /// Modes of a later output must not replace the built-in display's modes, and a
+    /// missing built-in display must not be papered over with a guessed name.
+    #[test]
+    fn test_parse_kscreen_builtin_output() {
+        let two_outputs = "Output: 1 eDP-2 uuid\n  enabled\n  Modes:  1:2560x1600@240.00*!\n\
+                           Output: 2 HDMI-1 uuid\n  Modes:  1:1920x1080@60.00*!\n";
+        let (name, modes) = parse_kscreen_builtin_output(two_outputs).expect("built-in found");
+
+        assert_eq!(name, "eDP-2");
+        assert_eq!(modes.len(), 1);
+        assert_eq!(modes[0].resolution, (2560, 1600));
+
+        let external_only = "Output: 1 HDMI-1 uuid\n  Modes:  1:1920x1080@60.00*!\n";
+        assert!(parse_kscreen_builtin_output(external_only).is_none());
+    }
+
+    #[test]
+    fn test_find_builtin_display_name_has_no_default() {
+        let lines = ["HDMI-1 connected", "DP-1 disconnected"];
+        assert_eq!(find_builtin_display_name(lines.into_iter(), |_| true), None);
+
+        let lines = ["HDMI-1 connected", "LVDS-1 connected primary"];
+        assert_eq!(
+            find_builtin_display_name(lines.into_iter(), |line| line.contains(" connected")),
+            Some("LVDS-1".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_wlr_randr_mode() {
+        let json = serde_json::json!(
+            { "width": 2560, "height": 1600, "refresh": 59.999001, "current": true }
+        );
+        let mode = parse_wlr_randr_mode(&json).expect("valid mode");
+
+        assert_eq!(mode.resolution, (2560, 1600));
+        assert_eq!(mode.mode_string, "2560x1600@59.999001");
+        assert!(mode.is_current);
+
+        assert!(parse_wlr_randr_mode(&serde_json::json!({ "width": 1 })).is_none());
+    }
+
+    #[test]
+    fn test_select_wlr_randr_output_prefers_enabled_builtin() {
+        let outputs: Vec<serde_json::Value> = serde_json::from_str(
+            r#"[
+                { "name": "HDMI-A-1", "enabled": true },
+                { "name": "eDP-2", "enabled": false },
+                { "name": "eDP-3", "enabled": true }
+            ]"#,
+        )
+        .unwrap();
+
+        assert_eq!(select_wlr_randr_output(&outputs).unwrap()["name"], "eDP-3");
+        assert_eq!(select_wlr_randr_output(&outputs[..2]).unwrap()["name"], "HDMI-A-1");
+        assert!(select_wlr_randr_output(&[]).is_none());
     }
 
     #[test]
