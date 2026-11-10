@@ -8,6 +8,7 @@ use std::{fs, io, path, thread, time};
 
 use crate::module::Module;
 
+use super::config::ConfigSnapshot;
 use super::device::GraphicsDevice;
 use super::error::GraphicsDeviceError;
 use super::mode::GraphicsMode;
@@ -141,6 +142,9 @@ pub struct SwitchReport {
     pub from: &'static str,
     pub to: &'static str,
     pub dm_restarted: Option<String>,
+    /// Set when the switch completed but the display manager could not be
+    /// started again (after one retry). `dm_restarted` is `None` in that case.
+    pub dm_restart_error: Option<String>,
     pub stage_reached: SwitchStage,
     pub no_change: bool,
 }
@@ -197,6 +201,11 @@ pub(crate) fn plan_transition(
 
 // ── Switch operations abstraction ─────────────────────────────────────────────
 
+/// NVIDIA driver modules unloaded on teardown, in unload order (dependents
+/// first), as named in `/proc/modules`.
+pub(crate) const NVIDIA_MODULES: &[&str] =
+    &["nvidia_drm", "nvidia_modeset", "nvidia_uvm", "nvidia"];
+
 /// Trait abstracting hardware, systemd, kernel module, and filesystem side-effects.
 pub(crate) trait SwitchOps {
     fn detect_display_manager(&self) -> Option<String>;
@@ -215,11 +224,15 @@ pub(crate) trait SwitchOps {
     ) -> Result<(), GraphicsDeviceError>;
     fn kill_nvidia_device_users(&self);
     fn unload_module(&self, module: &'static str) -> Result<(), GraphicsDeviceError>;
+    /// Names of the NVIDIA driver modules currently loaded (as in `/proc/modules`).
+    fn loaded_nvidia_modules(&self) -> Result<Vec<String>, GraphicsDeviceError>;
     fn load_module(&self, module: &'static str, options: &[&str]) -> Result<(), GraphicsDeviceError>;
     fn load_modules_for_mode(&self, mode: GraphicsMode) -> Result<(), GraphicsDeviceError>;
     fn unbind_device(&self, dev: &GraphicsDevice) -> Result<(), GraphicsDeviceError>;
     fn remove_device(&self, dev: &GraphicsDevice) -> Result<(), GraphicsDeviceError>;
     fn write_vendor_config(&self, mode: GraphicsMode) -> Result<(), GraphicsDeviceError>;
+    fn snapshot_config(&self) -> Result<ConfigSnapshot, GraphicsDeviceError>;
+    fn restore_config(&self, snapshot: &ConfigSnapshot) -> Result<(), GraphicsDeviceError>;
     fn rescan_pci(&self) -> Result<(), GraphicsDeviceError>;
     fn udev_settle(&self) -> Result<(), GraphicsDeviceError>;
     fn wait_for_device(&self, dev_id: &str, timeout_ms: u64) -> Result<bool, GraphicsDeviceError>;
@@ -306,6 +319,15 @@ impl SwitchOps for RealOps {
             .map_err(|why| GraphicsDeviceError::ModuleUnload { module, why })
     }
 
+    fn loaded_nvidia_modules(&self) -> Result<Vec<String>, GraphicsDeviceError> {
+        let modules = Module::all().map_err(GraphicsDeviceError::ModulesFetch)?;
+        Ok(modules
+            .into_iter()
+            .map(|m| m.name)
+            .filter(|name| NVIDIA_MODULES.contains(&name.as_str()))
+            .collect())
+    }
+
     fn load_module(&self, module: &'static str, options: &[&str]) -> Result<(), GraphicsDeviceError> {
         crate::modprobe::load(module, options)
             .map_err(|why| GraphicsDeviceError::ModuleLoad { module, why })
@@ -325,6 +347,14 @@ impl SwitchOps for RealOps {
 
     fn write_vendor_config(&self, mode: GraphicsMode) -> Result<(), GraphicsDeviceError> {
         super::config::write_vendor_config(mode)
+    }
+
+    fn snapshot_config(&self) -> Result<ConfigSnapshot, GraphicsDeviceError> {
+        ConfigSnapshot::capture()
+    }
+
+    fn restore_config(&self, snapshot: &ConfigSnapshot) -> Result<(), GraphicsDeviceError> {
+        snapshot.restore()
     }
 
     fn rescan_pci(&self) -> Result<(), GraphicsDeviceError> {
@@ -382,6 +412,10 @@ pub(crate) mod tests {
         pub fail_on_op: std::sync::Mutex<Option<&'static str>>,
         pub vendor: std::sync::Mutex<GraphicsMode>,
         pub live_state: std::sync::Mutex<LiveState>,
+        /// Modules reported loaded after a teardown unload.
+        pub loaded_modules: std::sync::Mutex<Vec<String>>,
+        /// Number of `start_display_manager` calls that fail before one succeeds.
+        pub dm_start_failures: std::sync::Mutex<usize>,
     }
 
     impl RecordingOps {
@@ -392,6 +426,8 @@ pub(crate) mod tests {
                 fail_on_op: std::sync::Mutex::new(None),
                 vendor: std::sync::Mutex::new(vendor),
                 live_state: std::sync::Mutex::new(live_state),
+                loaded_modules: std::sync::Mutex::new(Vec::new()),
+                dm_start_failures: std::sync::Mutex::new(0),
             }
         }
 
@@ -425,7 +461,15 @@ pub(crate) mod tests {
 
         fn start_display_manager(&self, dm: &str) -> Result<(), GraphicsDeviceError> {
             self.record(&format!("start_display_manager:{}", dm));
-            self.check_fail("start_display_manager")
+            let mut failures = self.dm_start_failures.lock().unwrap();
+            if *failures > 0 {
+                *failures -= 1;
+                return Err(GraphicsDeviceError::DisplayManagerStart {
+                    dm: dm.to_owned(),
+                    why: io::Error::other("injected start failure"),
+                });
+            }
+            Ok(())
         }
 
         fn stop_nvidia_services(&self) {
@@ -466,6 +510,11 @@ pub(crate) mod tests {
             self.check_fail(&format!("unload_module:{}", module))
         }
 
+        fn loaded_nvidia_modules(&self) -> Result<Vec<String>, GraphicsDeviceError> {
+            self.record("loaded_nvidia_modules");
+            Ok(self.loaded_modules.lock().unwrap().clone())
+        }
+
         fn load_module(&self, module: &'static str, options: &[&str]) -> Result<(), GraphicsDeviceError> {
             self.record(&format!("load_module:{}:{:?}", module, options));
             self.check_fail(&format!("load_module:{}", module))
@@ -489,6 +538,17 @@ pub(crate) mod tests {
         fn write_vendor_config(&self, mode: GraphicsMode) -> Result<(), GraphicsDeviceError> {
             self.record(&format!("write_vendor_config:{:?}", mode));
             self.check_fail("write_vendor_config")
+        }
+
+        fn snapshot_config(&self) -> Result<ConfigSnapshot, GraphicsDeviceError> {
+            self.record("snapshot_config");
+            self.check_fail("snapshot_config")?;
+            Ok(ConfigSnapshot::default())
+        }
+
+        fn restore_config(&self, _snapshot: &ConfigSnapshot) -> Result<(), GraphicsDeviceError> {
+            self.record("restore_config");
+            self.check_fail("restore_config")
         }
 
         fn rescan_pci(&self) -> Result<(), GraphicsDeviceError> {
@@ -936,5 +996,177 @@ pub(crate) mod tests {
                 }
             }
         }
+    }
+
+    fn live_loaded() -> LiveState {
+        LiveState {
+            nvidia_modules_loaded: true,
+            dgpu_driver_bound: true,
+            dgpu_display_connected: None,
+        }
+    }
+
+    fn live_clean() -> LiveState {
+        LiveState {
+            nvidia_modules_loaded: false,
+            dgpu_driver_bound: false,
+            dgpu_display_connected: None,
+        }
+    }
+
+    fn gdm() -> Option<String> { Some("gdm".to_string()) }
+
+    fn position(calls: &[String], call: &str) -> usize {
+        calls
+            .iter()
+            .position(|c| c == call)
+            .unwrap_or_else(|| panic!("{} not called: {:?}", call, calls))
+    }
+
+    #[test]
+    fn test_dm_restart_failure_is_retried_then_reported() {
+        let mut graphics = mock_graphics();
+        let ops = RecordingOps::new(GraphicsMode::Integrated, live_clean(), gdm());
+        *ops.dm_start_failures.lock().unwrap() = 2;
+
+        let report = graphics
+            .switch_runtime_with_ops(&ops, GraphicsMode::Hybrid, RestartPolicy::Always)
+            .expect("the switch itself succeeded");
+
+        assert_eq!(report.dm_restarted, None);
+        assert!(report.dm_restart_error.is_some(), "restart failure must be reported");
+
+        let calls = ops.calls.lock().unwrap();
+        let starts = calls.iter().filter(|c| *c == "start_display_manager:gdm").count();
+        assert_eq!(starts, 2, "start must be retried exactly once");
+    }
+
+    #[test]
+    fn test_dm_restart_succeeds_on_retry() {
+        let mut graphics = mock_graphics();
+        let ops = RecordingOps::new(GraphicsMode::Integrated, live_clean(), gdm());
+        *ops.dm_start_failures.lock().unwrap() = 1;
+
+        let report = graphics
+            .switch_runtime_with_ops(&ops, GraphicsMode::Hybrid, RestartPolicy::Always)
+            .expect("switch must succeed");
+
+        assert_eq!(report.dm_restarted, Some("gdm".to_string()));
+        assert_eq!(report.dm_restart_error, None);
+    }
+
+    #[test]
+    fn test_dm_restart_failure_after_failed_switch_is_reported() {
+        let mut graphics = mock_graphics();
+        let ops = RecordingOps::new(GraphicsMode::Integrated, live_clean(), gdm());
+        *ops.fail_on_op.lock().unwrap() = Some("rescan_pci");
+        *ops.dm_start_failures.lock().unwrap() = 2;
+
+        match graphics.switch_runtime_with_ops(&ops, GraphicsMode::Hybrid, RestartPolicy::Always) {
+            Err(GraphicsDeviceError::RuntimeSwitch { dm_restart_error, .. }) => {
+                assert!(dm_restart_error.is_some());
+            }
+            other => panic!("expected RuntimeSwitch, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_modules_still_loaded_aborts_teardown_and_rolls_back() {
+        let mut graphics = mock_graphics();
+        let ops = RecordingOps::new(GraphicsMode::Hybrid, live_loaded(), gdm());
+        *ops.loaded_modules.lock().unwrap() = vec!["nvidia".to_string()];
+
+        let err = graphics
+            .switch_runtime_with_ops(&ops, GraphicsMode::Integrated, RestartPolicy::Always)
+            .expect_err("switch must fail while nvidia is still loaded");
+
+        match err {
+            GraphicsDeviceError::RuntimeSwitch { stage, why, .. } => {
+                assert_eq!(stage, SwitchStage::Teardown);
+                let still_loaded = match *why {
+                    GraphicsDeviceError::ModulesStillLoaded { ref modules } => modules.clone(),
+                    ref other => panic!("unexpected cause: {:?}", other),
+                };
+                assert_eq!(still_loaded, ["nvidia"]);
+            }
+            other => panic!("expected RuntimeSwitch, got {:?}", other),
+        }
+
+        let calls = ops.calls.lock().unwrap();
+        assert!(
+            !calls.iter().any(|c| c.starts_with("unbind_device")),
+            "must not unbind with modules loaded"
+        );
+        assert!(!calls.contains(&"write_vendor_config:Integrated".to_string()));
+        assert!(
+            calls.contains(&"load_modules_for_mode:Hybrid".to_string()),
+            "rollback must reload the driver"
+        );
+        assert!(calls.contains(&"start_display_manager:gdm".to_string()));
+    }
+
+    #[test]
+    fn test_individual_unload_failures_are_tolerated_when_modules_are_gone() {
+        let mut graphics = mock_graphics();
+        let ops = RecordingOps::new(GraphicsMode::Hybrid, live_loaded(), gdm());
+        // `modprobe -r nvidia_drm` already took nvidia_modeset with it.
+        *ops.fail_on_op.lock().unwrap() = Some("unload_module:nvidia_modeset");
+
+        graphics
+            .switch_runtime_with_ops(&ops, GraphicsMode::Integrated, RestartPolicy::Always)
+            .expect("switch must succeed once no module remains");
+
+        let calls = ops.calls.lock().unwrap();
+        let verified = position(&calls, "loaded_nvidia_modules");
+        assert!(verified < position(&calls, "unbind_device:0000:01:00.0"));
+    }
+
+    #[test]
+    fn test_rollback_restores_config_snapshot_after_hardware() {
+        let mut graphics = mock_graphics();
+        let ops = RecordingOps::new(GraphicsMode::Integrated, live_clean(), gdm());
+        *ops.fail_on_op.lock().unwrap() = Some("load_modules_for_mode:Hybrid");
+
+        let _ = graphics.switch_runtime_with_ops(&ops, GraphicsMode::Hybrid, RestartPolicy::Always);
+
+        let calls = ops.calls.lock().unwrap();
+        // Snapshot precedes every side effect.
+        assert!(position(&calls, "snapshot_config") < position(&calls, "stop_display_manager:gdm"));
+        // Live-mode config is written so the hardware rollback can load modules,
+        // then the exact snapshot is put back last.
+        let live_config =
+            calls.iter().rposition(|c| c == "write_vendor_config:Integrated").unwrap();
+        assert!(live_config < position(&calls, "restore_config"));
+        assert!(
+            calls.iter().rposition(|c| c.starts_with("unload_module")).unwrap()
+                < position(&calls, "restore_config")
+        );
+    }
+
+    #[test]
+    fn test_snapshot_failure_aborts_before_side_effects() {
+        let mut graphics = mock_graphics();
+        let ops = RecordingOps::new(GraphicsMode::Integrated, live_clean(), gdm());
+        *ops.fail_on_op.lock().unwrap() = Some("snapshot_config");
+
+        graphics
+            .switch_runtime_with_ops(&ops, GraphicsMode::Hybrid, RestartPolicy::Always)
+            .expect_err("switch must fail");
+
+        let calls = ops.calls.lock().unwrap();
+        assert_eq!(*calls, vec!["snapshot_config".to_string()]);
+    }
+
+    #[test]
+    fn test_failed_restore_marks_rollback_incomplete() {
+        let mut graphics = mock_graphics();
+        let ops = RecordingOps::new(GraphicsMode::Hybrid, live_loaded(), None);
+        *ops.fail_on_op.lock().unwrap() = Some("restore_config");
+
+        let snapshot = ConfigSnapshot::default();
+        let result = graphics.rollback_with_ops(&ops, GraphicsMode::Hybrid, &snapshot);
+
+        assert!(result.is_err(), "a failed config restore must not count as rolled back");
+        assert!(ops.calls.lock().unwrap().contains(&"load_modules_for_mode:Hybrid".to_string()));
     }
 }

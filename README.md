@@ -163,17 +163,17 @@ system76-power graphics runtime --status
 
 ### Options
 
-- `--wait`: Subscribes to D-Bus completion and failure signals (`GraphicsModeChanged`, `GraphicsSwitchFailed`, `GraphicsInitramfsDone`) and blocks until the switch and initramfs rebuild finish. Ideal for scripts, TTYs, or SSH sessions.
-- `--status`: Queries `/run/system76-power/graphics-switch.json` via D-Bus and displays the detailed report of the most recent switch (stage reached, success, rollback status, restarted DM).
+- `--wait`: Subscribes to D-Bus completion and failure signals (`GraphicsModeChanged`, `GraphicsSwitchFailed`, `GraphicsInitramfsDone`) and blocks until the switch and initramfs rebuild finish. Returns right away for a no-op switch, which has no rebuild. Warns if the display manager could not be restarted. Ideal for scripts, TTYs, or SSH sessions.
+- `--status`: Queries `/run/system76-power/graphics-switch.json` via D-Bus and displays the detailed report of the most recent switch (stage reached, success, rollback status, restarted DM, `dm_restart_error` if the display manager failed to come back). `in_progress` stays `true` until the background initramfs rebuild has finished.
 
 ### How It Works
 
-1. **Synchronous Validation & Planning**: The daemon validates the target mode, verifies hardware switchability, probes live driver and connector status, and evaluates the `[graphics] runtime_restart_dm` policy. Incompatible requests or no-ops (`from == to`) return immediately without touching hardware.
-2. **Concurrency Guard**: A mutual exclusion flag (`switch_in_progress`) prevents conflicting switches or hardware manipulation while a live switch is actively executing.
-3. **Display Manager Management**: Managed through an RAII `DmGuard` that restores or restarts the detected display manager (GDM, SDDM, LightDM, greetd) on both success and error.
+1. **Synchronous Validation & Planning**: The daemon validates the target mode (unknown mode names are rejected with `InvalidArgs`), verifies hardware switchability, probes live driver and connector status, and evaluates the `[graphics] runtime_restart_dm` policy. Incompatible requests or no-ops (`from == to`) return immediately without touching hardware.
+2. **Concurrency Guard**: Only one graphics mode change (runtime or boot-time) runs at a time, from validation until its initramfs rebuild and final status write finish. Other graphics queries are refused only while hardware is being switched (`switch_in_progress`).
+3. **Display Manager Management**: Managed through an RAII `DmGuard` that restores or restarts the detected display manager (GDM, SDDM, LightDM, greetd) on both success and error. A failed restart is retried once, then reported (`dm_restart_error`) instead of counted as a success.
 4. **Framebuffer & Console Safety**: VT consoles are resolved dynamically; only NVIDIA-bound framebuffers are unbound, preserving iGPU text console output (TTYs) throughout the switch.
-5. **Driver Teardown & Bring-up**: Unloads or loads NVIDIA drivers, sets DRM modeset parameters (`nvidia-drm modeset=1`), loads `nvidia_uvm`, settles udev events, and polls for DRM card readiness.
-6. **Automatic Rollback**: If any intermediate stage fails, the daemon automatically reverts configuration files, unloads partially loaded modules, unbinds/removes discrete devices if needed, and starts the display manager.
+5. **Driver Teardown & Bring-up**: Unloads or loads NVIDIA drivers (teardown checks `/proc/modules` and aborts if any NVIDIA module is still loaded), sets DRM modeset parameters (`nvidia-drm modeset=1`), loads `nvidia_uvm`, settles udev events, and polls for DRM card readiness.
+6. **Automatic Rollback**: If any intermediate stage fails, the daemon automatically restores the configuration files and NVIDIA unit enablement captured before the switch, exactly as they were (so a pending boot-time mode selection survives), unloads partially loaded modules, unbinds/removes discrete devices if needed, and starts the display manager.
 7. **Background Initramfs Rebuild**: After the live switch succeeds, the initramfs is rebuilt asynchronously in the background so that the next boot remains in sync.
 
 ### Display Manager Restart Policy
@@ -188,7 +188,7 @@ runtime_restart_dm = "always"
 
 - `always`: Stops and restarts the display manager on every runtime switch.
 - `auto`: Skips stopping/restarting the display manager when hardware teardown is not needed (e.g., Integrated → Hybrid on Wayland compositors with dynamic offload).
-- `never`: Never stops or restarts the display manager. Fails early with an error if active users or processes hold the GPU during required teardown.
+- `never`: Never stops or restarts the display manager. Fails early with an error if active users or processes hold the GPU during required teardown, or if that cannot be determined (processes are found by scanning `/proc`).
 
 ### Discrete Mode (Reboot Required)
 

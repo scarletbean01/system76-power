@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 use std::{
-    fs,
+    fs, io,
     io::Write,
     path, process,
 };
@@ -289,4 +289,169 @@ pub(crate) fn write_vendor_config(vendor: GraphicsMode) -> Result<(), GraphicsDe
     }
 
     Ok(())
+}
+
+// ── Config snapshot ───────────────────────────────────────────────────────────
+
+/// systemd units whose enablement `write_vendor_config` may change.
+const MANAGED_UNITS: &[&str] = &[
+    "nvidia-hibernate.service",
+    "nvidia-resume.service",
+    "nvidia-suspend.service",
+    "nvidia-powerd.service",
+];
+
+/// The on-disk graphics configuration as it was before a runtime switch.
+///
+/// A failed switch restores this exactly, rather than regenerating config for
+/// the live mode. That keeps a boot-time mode that was selected but not yet
+/// rebooted into, and keeps the config consistent with the initramfs on disk
+/// (the failure path does not rebuild it).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct ConfigSnapshot {
+    /// Each managed file and its contents; `None` if it did not exist.
+    files: Vec<(path::PathBuf, Option<Vec<u8>>)>,
+    /// Each managed unit and whether it was enabled. Units in any other state
+    /// (static, masked, not installed) are left untouched on restore.
+    units: Vec<(&'static str, bool)>,
+}
+
+impl ConfigSnapshot {
+    pub(crate) fn capture() -> Result<Self, GraphicsDeviceError> {
+        let paths = [get_xorg_conf_path(), MODPROBE_PATH, PRIME_DISCRETE_PATH];
+        let files = capture_files(paths.iter().map(path::Path::new))
+            .map_err(GraphicsDeviceError::ConfigSnapshot)?;
+
+        let mut units = Vec::new();
+        for &unit in MANAGED_UNITS {
+            if let Some(enabled) =
+                unit_enablement(unit).map_err(GraphicsDeviceError::ConfigSnapshot)?
+            {
+                units.push((unit, enabled));
+            }
+        }
+
+        Ok(Self { files, units })
+    }
+
+    /// Put every file and unit back as captured. Attempts every item even if
+    /// one fails, then reports all failures together.
+    pub(crate) fn restore(&self) -> Result<(), GraphicsDeviceError> {
+        let mut failures = restore_files(&self.files);
+
+        for &(unit, enabled) in &self.units {
+            let (action, result) = if enabled {
+                ("enable", systemd::enable(unit))
+            } else {
+                ("disable", systemd::disable(unit))
+            };
+            match result {
+                Ok(status) if status.success() => (),
+                Ok(status) => failures.push(format!("systemctl {} {}: {}", action, unit, status)),
+                Err(why) => failures.push(format!("systemctl {} {}: {}", action, unit, why)),
+            }
+        }
+
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(GraphicsDeviceError::ConfigRestore(io::Error::other(failures.join("; "))))
+        }
+    }
+}
+
+fn capture_files<'a>(
+    paths: impl IntoIterator<Item = &'a path::Path>,
+) -> io::Result<Vec<(path::PathBuf, Option<Vec<u8>>)>> {
+    paths
+        .into_iter()
+        .map(|path| match fs::read(path) {
+            Ok(contents) => Ok((path.to_path_buf(), Some(contents))),
+            Err(why) if why.kind() == io::ErrorKind::NotFound => Ok((path.to_path_buf(), None)),
+            Err(why) => Err(io::Error::new(why.kind(), format!("{}: {}", path.display(), why))),
+        })
+        .collect()
+}
+
+/// Restore captured files, returning a description of each failure.
+fn restore_files(files: &[(path::PathBuf, Option<Vec<u8>>)]) -> Vec<String> {
+    let mut failures = Vec::new();
+    for (path, contents) in files {
+        let result = match contents {
+            Some(contents) => fs::OpenOptions::new()
+                .create(true)
+                .truncate(true)
+                .write(true)
+                .open(path)
+                .and_then(|mut file| file.write_all(contents).and_then(|()| file.sync_all())),
+            None => match fs::remove_file(path) {
+                Err(why) if why.kind() == io::ErrorKind::NotFound => Ok(()),
+                other => other,
+            },
+        };
+        if let Err(why) = result {
+            failures.push(format!("{}: {}", path.display(), why));
+        }
+    }
+    failures
+}
+
+/// `Some(true)` if `unit` is enabled, `Some(false)` if disabled, `None` for any
+/// other state (static, masked, not installed, ...).
+fn unit_enablement(unit: &str) -> io::Result<Option<bool>> {
+    // `is-enabled` exits non-zero for disabled units, so only stdout matters.
+    let output =
+        process::Command::new(systemd::SYSTEMCTL_CMD).args(["is-enabled", unit]).output()?;
+    Ok(match String::from_utf8_lossy(&output.stdout).trim() {
+        "enabled" => Some(true),
+        "disabled" => Some(false),
+        _ => None,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn snapshot_files_restore_contents_and_absence() {
+        let dir = std::env::temp_dir().join(format!("s76_test_cfg_snapshot_{}", process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let existing = dir.join("system76-power.conf");
+        let absent = dir.join("11-nvidia-discrete.conf");
+        fs::write(&existing, b"blacklist nouveau\n").unwrap();
+
+        let snapshot = capture_files([existing.as_path(), absent.as_path()]).unwrap();
+
+        // Simulate a switch rewriting one file and creating the other.
+        fs::write(&existing, b"options nvidia-drm modeset=1\n").unwrap();
+        fs::write(&absent, b"Section \"OutputClass\"\n").unwrap();
+
+        assert!(restore_files(&snapshot).is_empty());
+        assert_eq!(fs::read(&existing).unwrap(), b"blacklist nouveau\n");
+        assert!(!absent.exists(), "a file absent at snapshot time must be removed again");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn restore_files_reports_failures_and_continues() {
+        let dir = std::env::temp_dir().join(format!("s76_test_cfg_restore_{}", process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let good = dir.join("good");
+        let snapshot = vec![
+            (dir.join("missing-dir/file"), Some(b"x".to_vec())),
+            (good.clone(), Some(b"ok".to_vec())),
+        ];
+
+        let failures = restore_files(&snapshot);
+        assert_eq!(failures.len(), 1);
+        assert_eq!(fs::read(&good).unwrap(), b"ok");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
 }

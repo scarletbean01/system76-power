@@ -52,6 +52,8 @@ pub enum GraphicsDeviceError {
         stage: super::transition::SwitchStage,
         why: Box<GraphicsDeviceError>,
         rolled_back: bool,
+        /// Set if the display manager could not be started again afterwards.
+        dm_restart_error: Option<String>,
     },
     #[error("NVIDIA device {id} not found on PCI bus")]
     DeviceNotFound { id: String },
@@ -59,6 +61,14 @@ pub enum GraphicsDeviceError {
     ModesetDisabled,
     #[error("NVIDIA device is in use by processes: {pids:?}")]
     DeviceBusy { pids: Vec<u32> },
+    #[error("could not determine which processes use the NVIDIA device: {}", _0)]
+    DeviceUsageUnknown(io::Error),
+    #[error("NVIDIA kernel modules still loaded after unloading: {}", modules.join(", "))]
+    ModulesStillLoaded { modules: Vec<String> },
+    #[error("failed to snapshot graphics configuration: {}", _0)]
+    ConfigSnapshot(io::Error),
+    #[error("failed to restore graphics configuration: {}", _0)]
+    ConfigRestore(io::Error),
     #[error("cannot switch: display active on discrete GPU ({connector})")]
     DgpuDisplayActive { connector: String },
     #[error(

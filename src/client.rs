@@ -173,6 +173,37 @@ this device is either a desktop or doesn't have both an iGPU and dGPU.
                             }
                         }
 
+                        // Only a real switch is followed by an initramfs rebuild
+                        // and `GraphicsInitramfsDone`. The daemon records the status
+                        // before emitting `GraphicsModeChanged`, keeping
+                        // `in_progress` set while a rebuild is pending.
+                        let status = client
+                            .get_graphics_switch_status()
+                            .await
+                            .ok()
+                            .and_then(|json| serde_json::from_str::<serde_json::Value>(&json).ok())
+                            .unwrap_or_default();
+
+                        if let Some(why) = status["dm_restart_error"].as_str() {
+                            eprintln!(
+                                "Warning: the display manager could not be restarted: {}\n\
+                                 Start it manually, e.g. 'systemctl start display-manager'.",
+                                why
+                            );
+                        }
+
+                        // An unreadable status keeps the old behaviour: wait.
+                        if status["in_progress"].as_bool() == Some(false) {
+                            match status["initramfs_success"].as_bool() {
+                                Some(true) => println!("Initramfs rebuild completed successfully."),
+                                Some(false) => {
+                                    eprintln!("Warning: Background initramfs rebuild failed.")
+                                }
+                                None => println!("No initramfs rebuild needed."),
+                            }
+                            return Ok(());
+                        }
+
                         println!("Waiting for background initramfs rebuild...");
                         if let Some(signal) = initramfs_done.next().await {
                             if let Ok(args) = signal.args() {

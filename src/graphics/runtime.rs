@@ -193,85 +193,141 @@ fn fb_belongs_to_nvidia(sysfs: &path::Path, nvidia_devices: &[GraphicsDevice]) -
     false
 }
 
-// ── Kill device users ─────────────────────────────────────────────────────────
+// ── Device users ──────────────────────────────────────────────────────────────
 
-/// Check if any processes are holding NVIDIA devices without killing them.
-/// Used when no display manager is active to avoid aborting a user's direct session.
-pub(crate) fn check_device_users_idle(
-    nvidia_devices: &[GraphicsDevice],
-) -> Result<(), GraphicsDeviceError> {
-    let mut targets: Vec<String> = vec![
-        "/dev/nvidia0".into(),
-        "/dev/nvidiactl".into(),
-        "/dev/nvidia-modeset".into(),
-        "/dev/nvidia-uvm".into(),
-    ];
+fn is_nvidia_node(path: &path::Path) -> bool {
+    path.to_str().is_some_and(|p| p.starts_with("/dev/nvidia"))
+}
 
-    for dev in nvidia_devices {
+/// DRM device nodes (`/dev/dri/card*`, `/dev/dri/renderD*`) of the given GPUs.
+fn drm_nodes(devices: &[GraphicsDevice]) -> Vec<path::PathBuf> {
+    let mut nodes = Vec::new();
+    for dev in devices {
         let dev_drm = format!("/sys/bus/pci/devices/{}/drm", dev.id());
         if let Ok(entries) = fs::read_dir(dev_drm) {
             for entry in entries.flatten() {
                 let name = entry.file_name().to_string_lossy().to_string();
                 if name.starts_with("card") || name.starts_with("renderD") {
-                    let dev_node = format!("/dev/dri/{}", name);
-                    if path::Path::new(&dev_node).exists() {
-                        targets.push(dev_node);
-                    }
+                    nodes.push(path::Path::new("/dev/dri").join(name));
                 }
             }
         }
     }
+    nodes
+}
 
-    let existing: Vec<String> =
-        targets.into_iter().filter(|d| path::Path::new(d).exists()).collect();
+/// True if the error means the process went away while we were inspecting it.
+fn process_exited(why: &io::Error) -> bool {
+    why.kind() == io::ErrorKind::NotFound || why.raw_os_error() == Some(libc::ESRCH)
+}
 
-    if existing.is_empty() {
-        return Ok(());
+/// PIDs, other than our own, that have a file descriptor open on, or a memory
+/// mapping of, a path accepted by `matches`. `proc_root` is normally `/proc`.
+///
+/// Errors if `proc_root` cannot be listed or a process cannot be inspected for
+/// any reason other than it exiting meanwhile, so callers can fail closed
+/// rather than assume the devices are idle.
+pub(crate) fn processes_using_in(
+    proc_root: &path::Path,
+    matches: &dyn Fn(&path::Path) -> bool,
+) -> io::Result<Vec<u32>> {
+    let self_pid = process::id();
+    let mut pids = Vec::new();
+
+    for entry in fs::read_dir(proc_root)? {
+        let entry = entry?;
+        let Some(pid) = entry.file_name().to_str().and_then(|n| n.parse::<u32>().ok()) else {
+            continue;
+        };
+        if pid == self_pid {
+            continue;
+        }
+        match process_uses(&entry.path(), matches) {
+            Ok(true) => pids.push(pid),
+            Ok(false) => (),
+            Err(why) if process_exited(&why) => (),
+            Err(why) => {
+                return Err(io::Error::new(
+                    why.kind(),
+                    format!("{}: {}", entry.path().display(), why),
+                ))
+            }
+        }
     }
 
-    let output = match process::Command::new("fuser").args(&existing).output() {
-        Ok(out) => out,
-        Err(e) => {
-            log::warn!("Could not execute fuser: {} (psmisc installed?)", e);
-            return Ok(());
+    pids.sort_unstable();
+    Ok(pids)
+}
+
+fn process_uses(proc_dir: &path::Path, matches: &dyn Fn(&path::Path) -> bool) -> io::Result<bool> {
+    for fd in fs::read_dir(proc_dir.join("fd"))? {
+        // An fd closed between listing and reading the link is simply gone.
+        let Ok(fd) = fd else { continue };
+        if let Ok(target) = fs::read_link(fd.path()) {
+            if matches(&target) {
+                return Ok(true);
+            }
+        }
+    }
+
+    // Mappings outlive the fd they were made from (CUDA maps /dev/nvidia*).
+    let maps = fs::read_to_string(proc_dir.join("maps"))?;
+    Ok(maps
+        .lines()
+        .filter_map(|line| line.split_whitespace().nth(5))
+        .any(|mapped| matches(path::Path::new(mapped))))
+}
+
+/// Check that no process holds the NVIDIA devices, without killing anything.
+/// Used when no display manager is managed, to avoid tearing the GPU out from
+/// under a user's session.
+///
+/// Fails closed: if usage cannot be determined, returns `DeviceUsageUnknown`.
+pub(crate) fn check_device_users_idle(
+    nvidia_devices: &[GraphicsDevice],
+) -> Result<(), GraphicsDeviceError> {
+    let drm = drm_nodes(nvidia_devices);
+    let pids = processes_using_in(path::Path::new("/proc"), &|p| {
+        is_nvidia_node(p) || drm.iter().any(|node| node == p)
+    })
+    .map_err(GraphicsDeviceError::DeviceUsageUnknown)?;
+
+    if pids.is_empty() {
+        Ok(())
+    } else {
+        Err(GraphicsDeviceError::DeviceBusy { pids })
+    }
+}
+
+/// Forcefully terminate any processes that still hold `/dev/nvidia*` open or
+/// mapped.
+///
+/// Best effort: anything left holding the devices makes the following module
+/// unload fail, which the teardown verifies and treats as an error.
+pub(crate) fn kill_nvidia_device_users() {
+    let pids = match processes_using_in(path::Path::new("/proc"), &is_nvidia_node) {
+        Ok(pids) => pids,
+        Err(why) => {
+            log::warn!("Could not list processes using /dev/nvidia*: {}", why);
+            return;
         }
     };
 
-    let mut pids = Vec::new();
-    let stdout_str = String::from_utf8_lossy(&output.stdout);
-    for token in stdout_str.split_whitespace() {
-        let digits: String = token.chars().filter(|c| c.is_ascii_digit()).collect();
-        if let Ok(pid) = digits.parse::<u32>() {
-            pids.push(pid);
-        }
-    }
-
-    if !pids.is_empty() {
-        return Err(GraphicsDeviceError::DeviceBusy { pids });
-    }
-
-    Ok(())
-}
-
-/// Forcefully terminate any processes that still hold open file descriptors on
-/// `/dev/nvidia*` device nodes.
-pub(crate) fn kill_nvidia_device_users() {
-    const NVIDIA_DEVICES: &[&str] =
-        &["/dev/nvidia0", "/dev/nvidiactl", "/dev/nvidia-modeset", "/dev/nvidia-uvm"];
-
-    let existing: Vec<&str> =
-        NVIDIA_DEVICES.iter().copied().filter(|d| path::Path::new(d).exists()).collect();
-
-    if existing.is_empty() {
-        log::info!("No /dev/nvidia* devices found; skipping fuser");
+    if pids.is_empty() {
+        log::info!("No processes hold /dev/nvidia*");
         return;
     }
 
-    log::info!("Killing processes holding /dev/nvidia* fds: {:?}", existing);
-    let result = process::Command::new("fuser").arg("-k").args(&existing).status();
-    match result {
-        Ok(s) => log::info!("fuser exited with {}", s),
-        Err(e) => log::warn!("fuser failed to execute: {} (psmisc installed?)", e),
+    log::info!("Killing processes holding /dev/nvidia*: {:?}", pids);
+    for &pid in &pids {
+        let Ok(raw) = libc::pid_t::try_from(pid) else { continue };
+        // SAFETY: kill(2) has no memory-safety preconditions.
+        if unsafe { libc::kill(raw, libc::SIGKILL) } != 0 {
+            let why = io::Error::last_os_error();
+            if !process_exited(&why) {
+                log::warn!("Could not kill {}: {}", pid, why);
+            }
+        }
     }
 
     thread::sleep(time::Duration::from_millis(500));
@@ -478,4 +534,69 @@ pub(crate) fn sysfs_power_control(pciid: String, mode: GraphicsMode) {
             file.write_all(pm.as_bytes()).and_then(|()| file.sync_all());
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::symlink;
+
+    fn fake_proc(name: &str) -> path::PathBuf {
+        let root = std::env::temp_dir().join(format!("s76_test_proc_{}_{}", name, process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    fn fake_process(root: &path::Path, pid: u32, fds: &[&str], maps: &str) {
+        let dir = root.join(pid.to_string());
+        fs::create_dir_all(dir.join("fd")).unwrap();
+        for (n, target) in fds.iter().enumerate() {
+            symlink(target, dir.join("fd").join(n.to_string())).unwrap();
+        }
+        fs::write(dir.join("maps"), maps).unwrap();
+    }
+
+    #[test]
+    fn finds_open_fds_and_mappings_but_not_unrelated_processes() {
+        let root = fake_proc("users");
+        fake_process(&root, 100, &["/dev/null", "/dev/nvidia0"], "");
+        fake_process(
+            &root,
+            200,
+            &["/dev/null"],
+            "7f00-7f10 rw-s 00000000 00:05 42   /dev/nvidiactl\n",
+        );
+        fake_process(&root, 300, &["/dev/dri/card0", "socket:[123]"], "");
+        fs::create_dir_all(root.join("self")).unwrap(); // non-PID entries are skipped
+
+        let pids = processes_using_in(&root, &is_nvidia_node).unwrap();
+        assert_eq!(pids, vec![100, 200]);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn idle_when_nothing_matches() {
+        let root = fake_proc("idle");
+        fake_process(&root, 100, &["/dev/null"], "");
+        assert_eq!(processes_using_in(&root, &is_nvidia_node).unwrap(), Vec::<u32>::new());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn exited_process_is_skipped() {
+        let root = fake_proc("exited");
+        // A PID directory without fd/ looks like a process that exited mid-scan.
+        fs::create_dir_all(root.join("100")).unwrap();
+        fake_process(&root, 200, &["/dev/nvidia-uvm"], "");
+        assert_eq!(processes_using_in(&root, &is_nvidia_node).unwrap(), vec![200]);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn unreadable_proc_fails_closed() {
+        let root = fake_proc("missing").join("does-not-exist");
+        assert!(processes_using_in(&root, &is_nvidia_node).is_err());
+    }
 }

@@ -89,6 +89,10 @@ pub struct GraphicsSwitchStatus {
     pub error: Option<String>,
     pub rolled_back: bool,
     pub dm_restarted: Option<String>,
+    /// Set when the switch itself completed but the display manager could not
+    /// be started again afterwards (the user is likely left without a session).
+    #[serde(default)]
+    pub dm_restart_error: Option<String>,
     pub initramfs_success: Option<bool>,
 }
 
@@ -105,6 +109,50 @@ fn record_switch_status(status: &GraphicsSwitchStatus) {
     })() {
         log::warn!("Could not record switch status: {}", e);
     }
+}
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+/// Parse a graphics mode name from a D-Bus argument, rejecting unknown names
+/// before any side effect happens.
+fn parse_graphics_mode(vendor: &str) -> zbus::fdo::Result<GraphicsMode> {
+    vendor.parse::<GraphicsMode>().map_err(|why| zbus::fdo::Error::InvalidArgs(why.to_string()))
+}
+
+fn mode_change_busy_error() -> zbus::fdo::Error {
+    zbus::fdo::Error::Failed("Graphics switch in progress".into())
+}
+
+/// Lock the shared `Graphics`, recovering from a poisoned mutex.
+fn lock_recovering(
+    graphics: &std::sync::Mutex<Graphics>,
+) -> std::sync::MutexGuard<'_, Graphics> {
+    graphics.lock().unwrap_or_else(|poisoned| {
+        log::warn!("Graphics mutex was poisoned; recovering");
+        poisoned.into_inner()
+    })
+}
+
+/// Holds a busy flag set for as long as it lives; clears it on drop, including
+/// when unwinding from a panic.
+struct FlagGuard(Arc<AtomicBool>);
+
+impl FlagGuard {
+    /// Set `flag` if it is clear. Returns `None` if it was already set.
+    fn acquire(flag: &Arc<AtomicBool>) -> Option<Self> {
+        flag.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .ok()
+            .map(|_| Self(flag.clone()))
+    }
+}
+
+impl Drop for FlagGuard {
+    fn drop(&mut self) { self.0.store(false, Ordering::SeqCst); }
 }
 
 struct PowerDaemon {
@@ -210,7 +258,12 @@ impl PowerDaemon {
 struct System76Power {
     daemon: Arc<Mutex<PowerDaemon>>,
     graphics: Arc<std::sync::Mutex<Graphics>>,
+    /// Set while a runtime switch is changing hardware state; graphics queries
+    /// are refused meanwhile.
     switch_in_progress: Arc<AtomicBool>,
+    /// Set for the whole of any graphics mode change, including config
+    /// persistence and the initramfs rebuild; only one mode change may run.
+    mode_change_busy: Arc<AtomicBool>,
 }
 
 impl System76Power {
@@ -390,27 +443,16 @@ impl System76Power {
     }
 
     async fn set_graphics(&mut self, vendor: &str) -> zbus::fdo::Result<()> {
-        if self.switch_in_progress.load(Ordering::SeqCst) {
-            return Err(zbus::fdo::Error::Failed("Graphics switch in progress".into()));
-        }
-        let mode = GraphicsMode::from(vendor);
+        let mode = parse_graphics_mode(vendor)?;
+
+        // Held until the config is written and the initramfs rebuilt, so this
+        // cannot overlap a runtime switch (or its background rebuild).
+        let busy = FlagGuard::acquire(&self.mode_change_busy).ok_or_else(mode_change_busy_error)?;
+
         let graphics = self.graphics.clone();
-        let switch_in_progress = self.switch_in_progress.clone();
         tokio::task::spawn_blocking(move || {
-            let mut g = match graphics.lock() {
-                Ok(g) => g,
-                Err(p) => {
-                    log::warn!("Graphics mutex was poisoned; recovering");
-                    p.into_inner()
-                }
-            };
-            if switch_in_progress.load(Ordering::SeqCst) {
-                return Err(crate::graphics::GraphicsDeviceError::Command {
-                    cmd: "set_vendor",
-                    why: std::io::Error::other("Graphics switch in progress"),
-                });
-            }
-            g.set_vendor(mode)
+            let _busy = busy;
+            lock_recovering(&graphics).set_vendor(mode)
         })
         .await
         .map_err(zbus_error_from_display)?
@@ -421,6 +463,9 @@ impl System76Power {
     ///
     /// Validates request compatibility fast, then spawns background orchestration.
     /// Emits `GraphicsModeChanged` on success or `GraphicsSwitchFailed` on error.
+    /// After a real (not no-op) switch, `GraphicsInitramfsDone` follows once the
+    /// background initramfs rebuild finishes; until then the recorded status
+    /// keeps `in_progress: true` and further mode changes are refused.
     ///
     /// Note: models where external displays are wired exclusively through the
     /// dGPU (e.g. oryp*, addw*, serw*) will return an error — use `SetGraphics`
@@ -430,74 +475,50 @@ impl System76Power {
         #[zbus(signal_context)] ctx: zbus::SignalContext<'_>,
         vendor: &str,
     ) -> zbus::fdo::Result<()> {
-        struct SwitchInProgressGuard(Arc<AtomicBool>);
-        impl Drop for SwitchInProgressGuard {
-            fn drop(&mut self) {
-                self.0.store(false, Ordering::SeqCst);
-            }
-        }
+        let mode = parse_graphics_mode(vendor)?;
+        let target = <&'static str>::from(mode).to_owned();
 
-        if self
-            .switch_in_progress
-            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-            .is_err()
-        {
-            return Err(zbus::fdo::Error::Failed("Graphics switch in progress".into()));
-        }
+        // `busy` covers the whole operation, including the initramfs rebuild and
+        // the final status write. `switching` covers only the hardware switch,
+        // during which other graphics queries are refused.
+        let busy = FlagGuard::acquire(&self.mode_change_busy).ok_or_else(mode_change_busy_error)?;
+        let switching =
+            FlagGuard::acquire(&self.switch_in_progress).ok_or_else(mode_change_busy_error)?;
 
-        let guard = SwitchInProgressGuard(self.switch_in_progress.clone());
-
-        let mode = GraphicsMode::from(vendor);
         let from_mode = {
-            let g = match self.graphics.lock() {
-                Ok(g) => g,
-                Err(p) => {
-                    log::warn!("Graphics mutex was poisoned; recovering");
-                    p.into_inner()
-                }
-            };
+            let g = lock_recovering(&self.graphics);
             if !g.can_switch() {
                 return Err(zbus::fdo::Error::Failed(
                     "Graphics switching is not supported on this device".into(),
                 ));
             }
-            let from = match g.get_vendor() {
-                Ok(m) => m,
-                Err(e) => return Err(zbus_error_from_display(e)),
-            };
-
-            let live = match crate::graphics::transition::LiveState::probe(&g) {
-                Ok(l) => l,
-                Err(e) => return Err(zbus_error_from_display(e)),
-            };
-            let ext_req = match g.get_external_displays_require_dgpu() {
-                Ok(r) => r,
-                Err(e) => return Err(zbus_error_from_display(e)),
-            };
+            let from = g.get_vendor().map_err(zbus_error_from_display)?;
+            let live = crate::graphics::transition::LiveState::probe(&g)
+                .map_err(zbus_error_from_display)?;
+            let ext_req =
+                g.get_external_displays_require_dgpu().map_err(zbus_error_from_display)?;
             let policy = crate::config::current().graphics.runtime_restart_dm;
             match crate::graphics::transition::plan_transition(from, mode, &live, policy, ext_req) {
                 crate::graphics::transition::PlanOutcome::NoChange => {
                     log::info!("Already in {:?} graphics mode with matching state", mode);
-                    let now = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs();
+                    // No initramfs rebuild follows, so `in_progress` is false and
+                    // no `GraphicsInitramfsDone` will be emitted.
                     record_switch_status(&GraphicsSwitchStatus {
-                        timestamp: now,
+                        timestamp: now_secs(),
                         from: <&'static str>::from(from).to_owned(),
-                        to: vendor.to_owned(),
+                        to: target.clone(),
                         in_progress: false,
                         success: true,
                         stage: Some(SwitchStage::Done),
                         error: None,
                         rolled_back: false,
                         dm_restarted: None,
+                        dm_restart_error: None,
                         initramfs_success: None,
                     });
-                    let v = vendor.to_owned();
                     let ctx_c1 = ctx.to_owned();
                     tokio::spawn(async move {
-                        let _ = System76Power::graphics_mode_changed(&ctx_c1, &v).await;
+                        let _ = System76Power::graphics_mode_changed(&ctx_c1, &target).await;
                     });
                     return Ok(());
                 }
@@ -510,65 +531,57 @@ impl System76Power {
             from
         };
 
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        let initial_status = GraphicsSwitchStatus {
-            timestamp: now,
+        record_switch_status(&GraphicsSwitchStatus {
+            timestamp: now_secs(),
             from: <&'static str>::from(from_mode).to_owned(),
-            to: vendor.to_owned(),
+            to: target.clone(),
             in_progress: true,
             success: false,
             stage: Some(SwitchStage::Initial),
             error: None,
             rolled_back: false,
             dm_restarted: None,
+            dm_restart_error: None,
             initramfs_success: None,
-        };
-        record_switch_status(&initial_status);
+        });
 
         let graphics = self.graphics.clone();
-        let vendor_owned = vendor.to_owned();
         let from_str = <&'static str>::from(from_mode).to_owned();
         let ctx_owned = ctx.to_owned();
 
         tokio::task::spawn_blocking(move || {
+            // Released only when this closure returns, after the final status
+            // write, so a later request cannot interleave with persistence.
+            let _busy = busy;
+
             let panic_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let mut g = match graphics.lock() {
-                    Ok(g) => g,
-                    Err(poisoned) => {
-                        log::warn!("Graphics mutex was poisoned; recovering");
-                        poisoned.into_inner()
-                    }
-                };
-                g.switch_runtime(mode)
+                lock_recovering(&graphics).switch_runtime(mode)
             }));
 
-            drop(guard);
-
-            let finish_time = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs();
+            drop(switching);
 
             match panic_res {
                 Ok(Ok(report)) => {
-                    log::info!("Runtime graphics switch to {} succeeded", vendor_owned);
+                    log::info!("Runtime graphics switch to {} succeeded", target);
+                    if let Some(ref why) = report.dm_restart_error {
+                        log::error!("Display manager did not restart after switch: {}", why);
+                    }
                     record_switch_status(&GraphicsSwitchStatus {
-                        timestamp: finish_time,
+                        timestamp: now_secs(),
                         from: from_str.clone(),
-                        to: vendor_owned.clone(),
-                        in_progress: false,
+                        to: target.clone(),
+                        // Still in progress: the initramfs rebuild follows.
+                        in_progress: true,
                         success: true,
                         stage: Some(report.stage_reached),
                         error: None,
                         rolled_back: false,
                         dm_restarted: report.dm_restarted.clone(),
+                        dm_restart_error: report.dm_restart_error.clone(),
                         initramfs_success: None,
                     });
 
-                    let v_clone = vendor_owned.clone();
+                    let v_clone = target.clone();
                     let ctx_c1 = ctx_owned.clone();
                     tokio::runtime::Handle::current().block_on(async move {
                         System76Power::graphics_mode_changed(&ctx_c1, &v_clone)
@@ -588,63 +601,64 @@ impl System76Power {
                         if initramfs_success { "succeeded" } else { "failed" }
                     );
 
-                    let finish_time2 = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs();
-
                     record_switch_status(&GraphicsSwitchStatus {
-                        timestamp: finish_time2,
+                        timestamp: now_secs(),
                         from: from_str,
-                        to: vendor_owned.clone(),
+                        to: target.clone(),
                         in_progress: false,
                         success: true,
                         stage: Some(report.stage_reached),
                         error: None,
                         rolled_back: false,
                         dm_restarted: report.dm_restarted,
+                        dm_restart_error: report.dm_restart_error,
                         initramfs_success: Some(initramfs_success),
                     });
 
-                    let v_clone2 = vendor_owned;
                     let ctx_c2 = ctx_owned;
                     tokio::runtime::Handle::current().block_on(async move {
-                        System76Power::graphics_initramfs_done(&ctx_c2, &v_clone2, initramfs_success)
+                        System76Power::graphics_initramfs_done(&ctx_c2, &target, initramfs_success)
                             .await
                             .unwrap_or_else(|e| log::warn!("Failed to emit GraphicsInitramfsDone: {}", e));
                     });
                 }
                 Ok(Err(err)) => {
-                    log::error!("Runtime graphics switch to {} failed: {}", vendor_owned, err);
-                    let (stage, stage_name, rolled_back) = match &err {
+                    log::error!("Runtime graphics switch to {} failed: {}", target, err);
+                    let (stage, stage_name, rolled_back, dm_restart_error) = match &err {
                         crate::graphics::GraphicsDeviceError::RuntimeSwitch {
                             stage,
                             rolled_back,
+                            dm_restart_error,
                             ..
-                        } => (Some(*stage), format!("{:?}", stage), *rolled_back),
-                        _ => (None, String::from("Unknown"), false),
+                        } => (
+                            Some(*stage),
+                            format!("{:?}", stage),
+                            *rolled_back,
+                            dm_restart_error.clone(),
+                        ),
+                        _ => (None, String::from("Unknown"), false, None),
                     };
 
                     record_switch_status(&GraphicsSwitchStatus {
-                        timestamp: finish_time,
+                        timestamp: now_secs(),
                         from: from_str,
-                        to: vendor_owned.clone(),
+                        to: target.clone(),
                         in_progress: false,
                         success: false,
                         stage,
                         error: Some(err.to_string()),
                         rolled_back,
                         dm_restarted: None,
+                        dm_restart_error,
                         initramfs_success: None,
                     });
 
-                    let v_clone = vendor_owned;
                     let err_str = err.to_string();
                     let ctx_c = ctx_owned;
                     tokio::runtime::Handle::current().block_on(async move {
                         System76Power::graphics_switch_failed(
                             &ctx_c,
-                            &v_clone,
+                            &target,
                             &stage_name,
                             &err_str,
                             rolled_back,
@@ -656,24 +670,24 @@ impl System76Power {
                 Err(panic_err) => {
                     log::error!("Runtime graphics switch panicked: {:?}", panic_err);
                     record_switch_status(&GraphicsSwitchStatus {
-                        timestamp: finish_time,
+                        timestamp: now_secs(),
                         from: from_str,
-                        to: vendor_owned.clone(),
+                        to: target.clone(),
                         in_progress: false,
                         success: false,
                         stage: None,
                         error: Some("internal panic during switch".into()),
                         rolled_back: false, // DmGuard might have worked, but we can't tell easily
                         dm_restarted: None,
+                        dm_restart_error: None,
                         initramfs_success: None,
                     });
 
-                    let v_clone = vendor_owned;
                     let ctx_c = ctx_owned;
                     tokio::runtime::Handle::current().block_on(async move {
                         System76Power::graphics_switch_failed(
                             &ctx_c,
-                            &v_clone,
+                            &target,
                             "Panic",
                             "internal panic during switch",
                             false,
@@ -1011,6 +1025,7 @@ pub async fn daemon() -> anyhow::Result<()> {
         daemon: daemon.clone(),
         graphics,
         switch_in_progress,
+        mode_change_busy: Arc::new(AtomicBool::new(false)),
     };
 
     match system76_daemon.auto_graphics_power().await {

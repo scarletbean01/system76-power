@@ -14,14 +14,57 @@ pub(crate) mod transition;
 pub(crate) use config::update_initramfs_cmd;
 pub use device::GraphicsDevice;
 pub use error::GraphicsDeviceError;
-pub use mode::GraphicsMode;
+pub use mode::{GraphicsMode, InvalidGraphicsMode};
 pub use transition::{RestartPolicy, SwitchReport, SwitchStage};
 
 use crate::{module::Module, pci::PciBus};
 use std::{fs, io};
 use sysfs_class::{PciDevice, SysClass};
 
-use config::EXTERNAL_DISPLAY_REQUIRES_NVIDIA;
+use config::{ConfigSnapshot, EXTERNAL_DISPLAY_REQUIRES_NVIDIA};
+use transition::{SwitchOps, NVIDIA_MODULES};
+
+/// Unload the NVIDIA driver stack and verify that it is gone.
+///
+/// `modprobe -r` also removes dependencies nothing else uses, so later modules
+/// in the list are often already gone and their unload "fails". Individual
+/// results are therefore only logged; the loaded-module list decides.
+fn unload_nvidia_modules<O: SwitchOps>(ops: &O) -> Result<(), GraphicsDeviceError> {
+    for &module in NVIDIA_MODULES {
+        if let Err(why) = ops.unload_module(module) {
+            log::debug!("{} (may already be unloaded)", why);
+        }
+    }
+
+    let remaining = ops.loaded_nvidia_modules()?;
+    if remaining.is_empty() {
+        Ok(())
+    } else {
+        Err(GraphicsDeviceError::ModulesStillLoaded { modules: remaining })
+    }
+}
+
+/// Start the display manager held by `guard` again, retrying once after a
+/// short delay. Returns `None` if no display manager is being managed.
+///
+/// The guard is marked restored either way: a further immediate restart from
+/// its `Drop` would not help, and the caller reports the failure instead.
+fn restart_display_manager<O: SwitchOps>(
+    ops: &O,
+    guard: &mut runtime::DmGuard,
+) -> Option<Result<String, GraphicsDeviceError>> {
+    let dm = guard.unit()?.to_owned();
+    let result = ops.start_display_manager(&dm).or_else(|why| {
+        log::warn!("{}; retrying once", why);
+        ops.sleep_ms(1000);
+        ops.start_display_manager(&dm)
+    });
+    guard.mark_restored();
+    if let Err(ref why) = result {
+        log::error!("Display manager could not be restarted: {}", why);
+    }
+    Some(result.map(|()| dm))
+}
 
 pub struct Graphics {
     pub bus: PciBus,
@@ -104,12 +147,24 @@ fn probe_devices() -> io::Result<ProbedDevices> {
 }
 
 impl Graphics {
+    /// Rescan the PCI bus, then probe graphics devices.
+    ///
+    /// The rescan can bring back a dGPU that was removed from the bus (as in
+    /// integrated mode), so this changes system state and needs root. Use
+    /// [`Graphics::probe`] to inspect without side effects.
     pub fn new() -> io::Result<Self> {
         let bus = PciBus::new()?;
 
         log::info!("Rescanning PCI bus");
         bus.rescan()?;
 
+        Self::probe_with(bus)
+    }
+
+    /// Probe the graphics devices currently on the PCI bus, without rescanning.
+    pub fn probe() -> io::Result<Self> { Self::probe_with(PciBus::new()?) }
+
+    fn probe_with(bus: PciBus) -> io::Result<Self> {
         let (amd, intel, nvidia, other) = probe_devices()?;
         Ok(Self { bus, amd, intel, nvidia, other })
     }
@@ -260,6 +315,7 @@ impl Graphics {
                     from: from.into(),
                     to: target.into(),
                     dm_restarted: None,
+                    dm_restart_error: None,
                     stage_reached: SwitchStage::Done,
                     no_change: true,
                 });
@@ -267,6 +323,11 @@ impl Graphics {
             transition::PlanOutcome::Rejected(err) => return Err(err),
             transition::PlanOutcome::Plan(p) => p,
         };
+
+        // Taken before any side effect so a failed switch puts back exactly the
+        // configuration that was on disk, which may select a boot-time mode other
+        // than the live one, instead of regenerating config for the live mode.
+        let config_snapshot = ops.snapshot_config()?;
 
         let dm_to_manage = if plan.restart_dm {
             ops.detect_display_manager()
@@ -289,15 +350,15 @@ impl Graphics {
         if let Some(ref dm) = dm_to_manage {
             current_stage = SwitchStage::StopDm;
             if let Err(why) = ops.stop_display_manager(dm) {
-                if let Some(dm_name) = dm_guard.unit() {
-                    let _ = ops.start_display_manager(dm_name);
-                    dm_guard.mark_restored();
-                }
+                let dm_restart_error = restart_display_manager(ops, &mut dm_guard)
+                    .and_then(Result::err)
+                    .map(|e| e.to_string());
                 return Err(GraphicsDeviceError::RuntimeSwitch {
                     target: target.into(),
                     stage: SwitchStage::StopDm,
                     why: Box::new(why),
                     rolled_back: false,
+                    dm_restart_error,
                 });
             }
             ops.sleep_ms(2000);
@@ -314,40 +375,43 @@ impl Graphics {
         match result {
             Ok(()) => {
                 ops.rebind_framebuffers(&console_state);
-                let dm_restarted = if let Some(dm) = dm_guard.unit().map(|s| s.to_string()) {
-                    current_stage = SwitchStage::StartDm;
-                    let res = ops.start_display_manager(&dm);
-                    dm_guard.mark_restored();
-                    if res.is_ok() {
-                        Some(dm)
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                };
+                // The switch itself succeeded, so a display manager that will not
+                // come back is reported alongside success rather than rolled back.
+                let (dm_restarted, dm_restart_error) =
+                    match restart_display_manager(ops, &mut dm_guard) {
+                        Some(Ok(dm)) => (Some(dm), None),
+                        Some(Err(why)) => (None, Some(why.to_string())),
+                        None => (None, None),
+                    };
 
                 Ok(SwitchReport {
                     from: from.into(),
                     to: target.into(),
                     dm_restarted,
+                    dm_restart_error,
                     stage_reached: SwitchStage::Done,
                     no_change: false,
                 })
             }
             Err(err) => {
                 log::error!("Runtime graphics switch failed at {:?}: {}", current_stage, err);
-                let rolled_back = self.rollback_with_ops(ops, from).is_ok();
+                let rolled_back = match self.rollback_with_ops(ops, from, &config_snapshot) {
+                    Ok(()) => true,
+                    Err(why) => {
+                        log::error!("Rollback incomplete: {}", why);
+                        false
+                    }
+                };
                 ops.rebind_framebuffers(&console_state);
-                if let Some(dm) = dm_guard.unit().map(|s| s.to_string()) {
-                    let _ = ops.start_display_manager(&dm);
-                    dm_guard.mark_restored();
-                }
+                let dm_restart_error = restart_display_manager(ops, &mut dm_guard)
+                    .and_then(Result::err)
+                    .map(|e| e.to_string());
                 Err(GraphicsDeviceError::RuntimeSwitch {
                     target: target.into(),
                     stage: current_stage,
                     why: Box::new(err),
                     rolled_back,
+                    dm_restart_error,
                 })
             }
         }
@@ -368,11 +432,7 @@ impl Graphics {
             *console_state = ops.unbind_framebuffers(&self.nvidia)?;
             ops.kill_nvidia_device_users();
 
-            for module in &["nvidia-drm", "nvidia-modeset", "nvidia_uvm", "nvidia"] {
-                if let Err(why) = ops.unload_module(module) {
-                    log::warn!("Could not unload {}: {} (continuing)", module, why);
-                }
-            }
+            unload_nvidia_modules(ops)?;
 
             for dev in &self.nvidia {
                 ops.unbind_device(dev)?;
@@ -443,26 +503,31 @@ impl Graphics {
         Ok(())
     }
 
+    /// Return hardware to the live mode `prev`, then put the on-disk
+    /// configuration back exactly as captured in `snapshot`.
     fn rollback_with_ops<O: transition::SwitchOps>(
         &mut self,
         ops: &O,
         prev: GraphicsMode,
+        snapshot: &ConfigSnapshot,
     ) -> Result<(), GraphicsDeviceError> {
         log::warn!("Rolling back graphics state to {:?}", prev);
         let mut success = true;
 
+        // Module loading reads the modprobe config (aliases, blacklists,
+        // options), so the hardware rollback needs config matching `prev`
+        // first. The exact snapshot is restored once hardware is back.
         if let Err(e) = ops.write_vendor_config(prev) {
-            log::error!("Failed to restore config for {:?}: {}", prev, e);
+            log::error!("Failed to write config for {:?}: {}", prev, e);
             success = false;
         }
 
         if prev == GraphicsMode::Integrated {
             ops.stop_nvidia_services();
             ops.kill_nvidia_device_users();
-            for module in &["nvidia-drm", "nvidia-modeset", "nvidia_uvm", "nvidia"] {
-                if let Err(why) = ops.unload_module(module) {
-                    log::warn!("Rollback failed to unload {}: {}", module, why);
-                }
+            if let Err(why) = unload_nvidia_modules(ops) {
+                log::error!("Rollback: {}", why);
+                success = false;
             }
             let runtimepm = nvidia::gpu_supports_runtimepm(&self.nvidia).unwrap_or(false);
             if !runtimepm {
@@ -486,6 +551,11 @@ impl Graphics {
                 success = false;
             }
             ops.start_enabled_nvidia_services();
+        }
+
+        if let Err(e) = ops.restore_config(snapshot) {
+            log::error!("{}", e);
+            success = false;
         }
 
         if success {
