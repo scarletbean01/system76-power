@@ -3,34 +3,26 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 use intel_pstate::PStateError;
-use std::{io, path::PathBuf, process};
+use std::{io, process};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ProfileError {
     #[error("failed to set backlight profiles: {0}")]
     Backlight(#[from] BacklightError),
-    #[error("failed to set disk power profiles: {0}")]
-    DiskPower(#[from] DiskPowerError),
     #[error("failed to set model profiles: {0}")]
     Model(#[from] ModelError),
     #[error("failed to set pstate profiles: {0}")]
     PState(#[from] PStateError),
     #[error("failed to set scsi host profiles: {0}")]
     ScsiHost(#[from] ScsiHostError),
+    #[error("failed to set AMD SMU limits: {0}")]
+    Ryzenadj(#[from] RyzenadjError),
 }
 
 #[derive(Debug, thiserror::Error)]
 pub enum BacklightError {
     #[error("failed to set backlight on {0}: {1}")]
     Set(String, io::Error),
-}
-
-#[derive(Debug, thiserror::Error)]
-pub enum DiskPowerError {
-    #[error("failed to set disk APM level on {:?} to {}: {}", _0, _1, _2)]
-    ApmLevel(PathBuf, u8, io::Error),
-    #[error("failed to set disk autosuspend delay on {:?} to {}: {}", _0, _1, _2)]
-    AutosuspendDelay(PathBuf, i32, io::Error),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -53,8 +45,14 @@ pub enum ModelError {
     MsrRead(io::Error),
     #[error("failed to write msr: {}", _0)]
     MsrWrite(io::Error),
-    #[error("failed to set TCC: {}", _0)]
-    Tcc(io::Error),
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum RyzenadjError {
+    #[error("failed to run ryzenadj: {0}")]
+    Spawn(io::Error),
+    #[error("ryzenadj exited with {status}: {stderr}")]
+    Exit { status: process::ExitStatus, stderr: String },
 }
 
 #[derive(Debug, thiserror::Error)]

@@ -12,6 +12,7 @@
 
 use crate::{
     Profile, acpi_platform, config, cpufreq,
+    daemon::profiles::settings,
     power_supply::{PowerSource, get_power_source},
 };
 use std::{fs, io::ErrorKind, process::Command};
@@ -23,7 +24,6 @@ const SCALING_GOVERNOR: &str = "/sys/devices/system/cpu/cpu0/cpufreq/scaling_gov
 const ENERGY_PREFERENCE: &str = "/sys/devices/system/cpu/cpu0/cpufreq/energy_performance_preference";
 const AVAILABLE_PREFERENCES: &str =
     "/sys/devices/system/cpu/cpu0/cpufreq/energy_performance_available_preferences";
-const LAPTOP_MODE: &str = "/proc/sys/vm/laptop_mode";
 const DIRTY_WRITEBACK: &str = "/proc/sys/vm/dirty_writeback_centisecs";
 const PCIE_ASPM_POLICY: &str = "/sys/module/pcie_aspm/parameters/policy";
 const HDA_POWER_SAVE: &str = "/sys/module/snd_hda_intel/parameters/power_save";
@@ -48,11 +48,11 @@ pub fn run() -> anyhow::Result<bool> {
     check_acpi_platform_profile(&mut tally, profile);
     check_boost(&mut tally, profile);
     check_governor(&mut tally, profile);
-    check_epp(&mut tally, profile);
-    check_laptop_mode(&mut tally, profile);
+    check_epp(&mut tally, profile, &config);
     check_dirty_writeback(&mut tally, profile);
     check_pcie_aspm(&mut tally, profile);
     check_hda_power_save(&mut tally, profile, &config);
+    check_panel_power_savings(&mut tally, profile, &config);
     check_wifi_power_save(&mut tally, profile, &config);
     check_bluetooth_rfkill(&mut tally, profile, &config);
     check_smu_limits(&mut tally);
@@ -112,31 +112,14 @@ fn expected_boost(profile: Profile) -> &'static str {
     }
 }
 
-/// `/proc/sys/vm/laptop_mode` value (`daemon::profiles`).
-fn expected_laptop_mode(profile: Profile) -> &'static str {
-    match profile {
-        Profile::Battery | Profile::Balanced => "2",
-        Profile::Performance => "0",
-    }
-}
-
 /// `/proc/sys/vm/dirty_writeback_centisecs` value
 /// (`Dirty::set_max_lost_work`: 30s/15s/10s → 3000/1500/1000).
-fn expected_dirty_writeback(profile: Profile) -> &'static str {
-    match profile {
-        Profile::Battery => "3000",
-        Profile::Balanced => "1500",
-        Profile::Performance => "1000",
-    }
+fn expected_dirty_writeback(profile: Profile) -> String {
+    (u64::from(settings(profile).dirty_secs) * 100).to_string()
 }
 
 /// Active PCIe ASPM policy (`PcieAspm`).
-fn expected_aspm(profile: Profile) -> &'static str {
-    match profile {
-        Profile::Battery => "powersupersave",
-        Profile::Balanced | Profile::Performance => "default",
-    }
-}
+fn expected_aspm(profile: Profile) -> &'static str { settings(profile).pcie_aspm }
 
 // ── Parsing helpers ──────────────────────────────────────────────────────────
 
@@ -249,7 +232,7 @@ fn check_governor(tally: &mut Tally, profile: Option<Profile>) {
     report_value(tally, LABEL, read_trimmed(SCALING_GOVERNOR), expected);
 }
 
-fn check_epp(tally: &mut Tally, profile: Option<Profile>) {
+fn check_epp(tally: &mut Tally, profile: Option<Profile>, config: &config::Config) {
     const LABEL: &str = "CPU energy performance preference";
 
     let Some(profile) = profile else {
@@ -261,7 +244,7 @@ fn check_epp(tally: &mut Tally, profile: Option<Profile>) {
         Err(reason) => return tally.skip(LABEL, &reason),
     };
 
-    let Some(mut expected) = cpufreq::epp_for(profile, &driver) else {
+    let Some(mut expected) = cpufreq::epp_for(profile, &driver, &config.cpu.battery_epp) else {
         return tally.skip(LABEL, "scaling driver does not support EPP");
     };
 
@@ -272,16 +255,6 @@ fn check_epp(tally: &mut Tally, profile: Option<Profile>) {
     }
 
     report_value(tally, LABEL, read_trimmed(ENERGY_PREFERENCE), &expected);
-}
-
-fn check_laptop_mode(tally: &mut Tally, profile: Option<Profile>) {
-    const LABEL: &str = "Laptop mode";
-
-    let Some(profile) = profile else {
-        return tally.skip(LABEL, "profile unknown");
-    };
-
-    report_value(tally, LABEL, read_trimmed(LAPTOP_MODE), expected_laptop_mode(profile));
 }
 
 fn check_dirty_writeback(tally: &mut Tally, profile: Option<Profile>) {
@@ -295,7 +268,7 @@ fn check_dirty_writeback(tally: &mut Tally, profile: Option<Profile>) {
         tally,
         LABEL,
         read_trimmed(DIRTY_WRITEBACK),
-        expected_dirty_writeback(profile),
+        &expected_dirty_writeback(profile),
     );
 }
 
@@ -331,6 +304,36 @@ fn check_hda_power_save(tally: &mut Tally, profile: Option<Profile>, config: &co
     // except performance, where it writes 0.
     let expected = if matches!(profile, Profile::Performance) { "0" } else { "1" };
     report_value(tally, LABEL, read_trimmed(HDA_POWER_SAVE), expected);
+}
+
+fn check_panel_power_savings(
+    tally: &mut Tally,
+    profile: Option<Profile>,
+    config: &config::Config,
+) {
+    const LABEL: &str = "Panel power savings (amdgpu ABM)";
+
+    let Some(profile) = profile else {
+        return tally.skip(LABEL, "profile unknown");
+    };
+
+    let path = fs::read_dir("/sys/class/drm").ok().and_then(|entries| {
+        entries
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().contains("-eDP-"))
+            .map(|entry| entry.path().join("amdgpu/panel_power_savings"))
+            .find(|path| path.exists())
+    });
+
+    let Some(path) = path else {
+        return tally.skip(LABEL, "no amdgpu panel_power_savings attribute");
+    };
+
+    let expected = match profile {
+        Profile::Battery => config.profile.battery_panel_power_savings,
+        Profile::Balanced | Profile::Performance => 0,
+    };
+    report_value(tally, LABEL, read_trimmed(&path.to_string_lossy()), &expected.to_string());
 }
 
 fn check_wifi_power_save(tally: &mut Tally, profile: Option<Profile>, config: &config::Config) {
@@ -549,13 +552,6 @@ mod tests {
         assert_eq!(expected_boost(Profile::Battery), "0");
         assert_eq!(expected_boost(Profile::Balanced), "1");
         assert_eq!(expected_boost(Profile::Performance), "1");
-    }
-
-    #[test]
-    fn laptop_mode_expectations() {
-        assert_eq!(expected_laptop_mode(Profile::Battery), "2");
-        assert_eq!(expected_laptop_mode(Profile::Balanced), "2");
-        assert_eq!(expected_laptop_mode(Profile::Performance), "0");
     }
 
     #[test]

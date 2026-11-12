@@ -43,9 +43,42 @@ pub static DBUS_NAME: &str = "com.system76.PowerDaemon";
 pub static DBUS_PATH: &str = "/com/system76/PowerDaemon";
 pub static DBUS_IFACE: &str = "com.system76.PowerDaemon";
 
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum Profile {
     Battery,
     Balanced,
     Performance,
+}
+
+impl Profile {
+    /// The name used on the `com.system76.PowerDaemon` D-Bus interface.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Battery => "Battery",
+            Self::Balanced => "Balanced",
+            Self::Performance => "Performance",
+        }
+    }
+
+    /// The name used by `power-profiles-daemon` (`org.freedesktop.UPower.PowerProfiles`).
+    #[must_use]
+    pub const fn upp_name(self) -> &'static str {
+        match self {
+            Self::Battery => "power-saver",
+            Self::Balanced => "balanced",
+            Self::Performance => "performance",
+        }
+    }
+
+    /// Parses a `power-profiles-daemon` profile name.
+    #[must_use]
+    pub fn from_upp_name(name: &str) -> Option<Self> {
+        match name {
+            "power-saver" => Some(Self::Battery),
+            "balanced" => Some(Self::Balanced),
+            "performance" => Some(Self::Performance),
+            _ => None,
+        }
+    }
 }

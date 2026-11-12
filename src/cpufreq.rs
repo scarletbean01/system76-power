@@ -9,79 +9,119 @@ use std::{
     io::Read,
 };
 
-pub fn set(profile: Profile, max_percent: u8) {
-    let mut core = Cpu::new(0);
+/// Directory holding one `policyN` subdirectory per cpufreq policy.
+const CPUFREQ_DIR: &str = "/sys/devices/system/cpu/cpufreq";
 
-    let min_freq = core.frequency_minimum();
-    let max_freq = core.frequency_maximum();
-
+/// Applies the governor, EPP, frequency cap and boost for `profile`.
+///
+/// `max_percent` caps `scaling_max_freq` relative to the boost ceiling
+/// (`amd_pstate_max_freq`, else `cpuinfo_max_freq`), never above what the
+/// current boost state allows; `battery_epp` is the configured Battery EPP.
+pub fn set(profile: Profile, max_percent: u8, battery_epp: &str) {
     log::info!("Setting CPU frequency for profile: {:?}", profile);
-    log::info!("  CPU frequency range: min={:?} kHz, max={:?} kHz", min_freq, max_freq);
 
-    if let Some(driver) = core.scaling_driver() {
-        log::info!("  Detected CPU scaling driver: {}", driver);
+    let policies = policy_dirs();
+    let Some(first) = policies.first() else {
+        log::error!("  No cpufreq policies found - cannot configure CPU frequency");
+        return;
+    };
 
-        // Decide the scaling governor and EPP preference for this profile.
-        let governor = governor_for(profile, driver);
-        let mut epp = epp_for(profile, driver);
-
-        // The battery EPP is user-configurable; fall back if the CPU does not
-        // advertise it.
-        if matches!(profile, Profile::Battery) {
-            if let Some(ref preference) = epp {
-                if !epp_available(preference) {
-                    log::warn!(
-                        "  EPP preference '{}' is not available; falling back to 'balance_power'",
-                        preference
-                    );
-                    epp = Some("balance_power".to_string());
-                }
-            }
-        }
-
-        log::info!("  Selected governor: {}", governor);
-        if let Some(ref pref) = epp {
-            log::info!("  EPP preference: {}", pref);
-        }
-
-        if let Some((cpus, (min, max))) = num_cpus().zip(min_freq.zip(max_freq)) {
-            let max = max * max_percent.min(100) as usize / 100;
-            log::info!(
-                "  Applying frequency limits: min={} kHz, max={} kHz ({}% of {} kHz)",
-                min,
-                max,
-                max_percent,
-                max_freq.unwrap_or(0)
-            );
-            log::info!("  Total CPUs to configure: {}", cpus + 1);
-
-            for cpu in 0..=cpus {
-                core.load(cpu);
-
-                // Set frequency limits for all drivers, including amd-pstate variants.
-                // Even though amd-pstate-epp primarily uses EPP (Energy Performance Preference)
-                // hints, the scaling_max_freq parameter must still be set to enforce the
-                // maximum frequency cap. Without this, the CPU can get stuck at low frequencies.
-                core.set_frequency_minimum(min);
-                core.set_frequency_maximum(max);
-
-                core.set_governor(governor);
-
-                if let Some(preference) = &epp {
-                    core.set_epp(preference);
-                }
-            }
-
-            log::info!("  CPU frequency configuration completed for {} cores", cpus + 1);
-        } else {
-            log::warn!("  Failed to get CPU count or frequency range - skipping CPU configuration");
-        }
-
-        // Set CPU boost for AMD/generic cpufreq (complements Intel PState no_turbo)
-        set_boost(profile);
-    } else {
+    let mut core = Cpu::from_dir(first);
+    let Some(driver) = core.scaling_driver().map(str::to_owned) else {
         log::error!("  Failed to detect CPU scaling driver - cannot configure CPU frequency");
+        return;
+    };
+    log::info!("  Detected CPU scaling driver: {}", driver);
+
+    // Decide the scaling governor and EPP preference for this profile.
+    let governor = governor_for(profile, &driver);
+    let mut epp = epp_for(profile, &driver, battery_epp);
+
+    // The battery EPP is user-configurable; fall back if the CPU does not
+    // advertise it.
+    if matches!(profile, Profile::Battery) {
+        if let Some(ref preference) = epp {
+            if !epp_available(preference) {
+                log::warn!(
+                    "  EPP preference '{}' is not available; falling back to 'balance_power'",
+                    preference
+                );
+                epp = Some("balance_power".to_string());
+            }
+        }
     }
+
+    log::info!("  Selected governor: {}", governor);
+    if let Some(ref pref) = epp {
+        log::info!("  EPP preference: {}", pref);
+    }
+
+    // Boost first: with boost disabled, amd-pstate lowers `cpuinfo_max_freq`
+    // to the nominal frequency. Reading it before re-enabling boost would cap
+    // `scaling_max_freq` at nominal and leave the CPU stuck there.
+    set_boost(profile, &policies);
+
+    let max_percent = max_percent.min(100);
+    let mut configured = 0;
+
+    // One write per policy: a policy may span several CPUs, and offline CPUs
+    // have no policy directory, so nothing is written to them.
+    for dir in &policies {
+        core.load_dir(dir);
+
+        let (Some(min), Some(max)) = (core.frequency_minimum(), core.frequency_maximum()) else {
+            log::warn!("  {}: no cpuinfo frequency range, skipping", dir);
+            continue;
+        };
+
+        // The cap is relative to the boost ceiling, which amd-pstate exposes
+        // independently of the boost state; never exceed what is reachable now.
+        let reference = core.amd_pstate_max_freq().unwrap_or(max);
+        let capped = (reference * usize::from(max_percent) / 100).min(max);
+
+        // Set frequency limits for all drivers, including amd-pstate variants.
+        // Even though amd-pstate-epp primarily uses EPP (Energy Performance Preference)
+        // hints, the scaling_max_freq parameter must still be set to enforce the
+        // maximum frequency cap. Without this, the CPU can get stuck at low frequencies.
+        core.set_frequency_minimum(min);
+        core.set_frequency_maximum(capped);
+
+        // The governor must be set before EPP: amd-pstate-epp rejects non-
+        // `performance` preferences while the `performance` governor is active.
+        core.set_governor(governor);
+
+        if let Some(preference) = &epp {
+            core.set_epp(preference);
+        }
+
+        configured += 1;
+    }
+
+    log::info!(
+        "  CPU frequency configured on {} of {} policies (cap {}%)",
+        configured,
+        policies.len(),
+        max_percent
+    );
+}
+
+/// The `policyN` directories under [`CPUFREQ_DIR`], sorted by policy number.
+fn policy_dirs() -> Vec<String> {
+    let Ok(dir) = fs::read_dir(CPUFREQ_DIR) else {
+        return Vec::new();
+    };
+
+    let mut policies: Vec<(usize, String)> = dir
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let name = entry.file_name();
+            let number = name.to_str()?.strip_prefix("policy")?.parse::<usize>().ok()?;
+            Some((number, [CPUFREQ_DIR, "/", name.to_str()?, "/"].concat()))
+        })
+        .collect();
+
+    policies.sort_unstable_by_key(|(number, _)| *number);
+    policies.into_iter().map(|(_, path)| path).collect()
 }
 
 /// Scaling governor for the given profile and CPU scaling driver.
@@ -107,13 +147,13 @@ pub fn governor_for(profile: Profile, driver: &str) -> &'static str {
 /// EPP (`energy_performance_preference`) for the given profile and driver, if
 /// the driver supports it. The battery preference is user-configurable.
 #[must_use]
-pub fn epp_for(profile: Profile, driver: &str) -> Option<String> {
+pub fn epp_for(profile: Profile, driver: &str, battery_epp: &str) -> Option<String> {
     if driver != "amd-pstate-epp" {
         return None;
     }
 
     Some(match profile {
-        Profile::Battery => crate::config::current().cpu.battery_epp.clone(),
+        Profile::Battery => battery_epp.to_owned(),
         Profile::Balanced => "balance_performance".to_string(),
         Profile::Performance => "performance".to_string(),
     })
@@ -134,10 +174,10 @@ fn epp_available(preference: &str) -> bool {
 /// Controls CPU boost/turbo for AMD and generic cpufreq drivers.
 /// This complements Intel PState's no_turbo parameter handled in daemon/profiles.rs
 /// and provides boost control for AMD Ryzen CPUs via the generic cpufreq boost interface.
-fn set_boost(profile: Profile) {
+fn set_boost(profile: Profile, policies: &[String]) {
     let boost_value = match profile {
-        Profile::Battery => b"0", // Disable boost on battery to save power
-        Profile::Balanced | Profile::Performance => b"1", // Enable boost
+        Profile::Battery => "0", // Disable boost on battery to save power
+        Profile::Balanced | Profile::Performance => "1", // Enable boost
     };
 
     // Try global boost path first (standard location)
@@ -145,30 +185,36 @@ fn set_boost(profile: Profile) {
     if std::path::Path::new(global_boost_path).exists() {
         match fs::write(global_boost_path, boost_value) {
             Ok(()) => {
-                log::info!(
-                    "CPU boost set to {} for {:?} profile",
-                    std::str::from_utf8(boost_value).unwrap_or("?"),
-                    profile
-                );
+                log::info!("CPU boost set to {} for {:?} profile", boost_value, profile);
                 return;
             }
             Err(e) => log::warn!("Failed to set CPU boost at {}: {}", global_boost_path, e),
         }
     }
 
-    // Fallback: try per-CPU boost path (some systems use this)
-    let per_cpu_boost_path = "/sys/devices/system/cpu/cpu0/cpufreq/boost";
-    if std::path::Path::new(per_cpu_boost_path).exists() {
-        match fs::write(per_cpu_boost_path, boost_value) {
-            Ok(()) => log::info!(
-                "CPU boost set to {} for {:?} profile (via per-CPU path)",
-                std::str::from_utf8(boost_value).unwrap_or("?"),
-                profile
-            ),
-            Err(e) => log::warn!("Failed to set CPU boost at {}: {}", per_cpu_boost_path, e),
+    // Fallback: per-policy boost (some drivers only expose it there).
+    let mut written = 0;
+    for policy in policies {
+        let path = [policy.as_str(), "boost"].concat();
+        if !std::path::Path::new(&path).exists() {
+            continue;
         }
+
+        match fs::write(&path, boost_value) {
+            Ok(()) => written += 1,
+            Err(e) => log::warn!("Failed to set CPU boost at {}: {}", path, e),
+        }
+    }
+
+    if written > 0 {
+        log::info!(
+            "CPU boost set to {} for {:?} profile on {} policies",
+            boost_value,
+            profile,
+            written
+        );
     } else {
-        log::debug!("CPU boost control not available (neither global nor per-CPU path found)");
+        log::debug!("CPU boost control not available (neither global nor per-policy path found)");
     }
 }
 
@@ -196,9 +242,28 @@ impl Cpu {
         self.path_len = self.path.len();
     }
 
+    /// Accesses the cpufreq directory `dir` (which must end in `/`), e.g. a
+    /// `/sys/devices/system/cpu/cpufreq/policyN/` directory.
+    #[must_use]
+    pub fn from_dir(dir: &str) -> Self {
+        Self { path_len: dir.len(), path: dir.to_owned(), read_buffer: Vec::with_capacity(16) }
+    }
+
+    pub fn load_dir(&mut self, dir: &str) {
+        self.path.clear();
+        self.path.push_str(dir);
+        self.path_len = self.path.len();
+    }
+
     #[must_use]
     pub fn frequency_maximum(&mut self) -> Option<usize> {
         self.get_value("cpuinfo_max_freq").and_then(|value| value.parse::<usize>().ok())
+    }
+
+    /// amd-pstate's highest (boost) frequency, independent of the boost state.
+    #[must_use]
+    pub fn amd_pstate_max_freq(&mut self) -> Option<usize> {
+        self.get_value("amd_pstate_max_freq").and_then(|value| value.parse::<usize>().ok())
     }
 
     #[must_use]
@@ -256,12 +321,6 @@ impl Cpu {
 
         std::str::from_utf8(&self.read_buffer).ok().map(str::trim)
     }
-}
-
-#[must_use]
-pub fn num_cpus() -> Option<usize> {
-    let info = fs::read_to_string("/sys/devices/system/cpu/possible").ok()?;
-    info.split('-').nth(1)?.trim_end().parse::<usize>().ok()
 }
 
 fn cpu_path(buffer: &mut String, core: usize) {

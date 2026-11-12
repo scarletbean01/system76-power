@@ -110,6 +110,74 @@ fn apply_display_mode(
     manager.apply_mode(&display_name, &mode)
 }
 
+/// Whether a failed display change is worth retrying later.
+///
+/// Session and command failures are usually transient (the compositor is
+/// still starting); a missing mode or unparseable output will not fix itself.
+#[must_use]
+pub fn is_retryable(error: &DisplayError) -> bool {
+    !matches!(error, DisplayError::ModeNotFound { .. } | DisplayError::ParseError { .. })
+}
+
+/// A cheap fingerprint of the running graphical sessions, or `None` when
+/// there are none.
+///
+/// It covers every Wayland socket (`/run/user/<uid>/wayland-N`) and X11
+/// socket (`/tmp/.X11-unix/X*`) by path and inode, so it changes whenever a
+/// compositor or X server starts or restarts (login, re-login, crash). Only
+/// directory listings and `stat`s: no processes are spawned, nothing is
+/// logged, so it is safe to poll.
+#[must_use]
+pub fn session_fingerprint() -> Option<u64> {
+    use std::{
+        hash::{DefaultHasher, Hash, Hasher},
+        os::unix::fs::{FileTypeExt, MetadataExt},
+        path::Path,
+    };
+
+    fn sockets(dir: &Path, matches: impl Fn(&str) -> bool, out: &mut Vec<(String, u64)>) {
+        let Ok(entries) = std::fs::read_dir(dir) else { return };
+        for entry in entries.filter_map(Result::ok) {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            if !matches(name) {
+                continue;
+            }
+            if let Ok(meta) = entry.metadata() {
+                if meta.file_type().is_socket() {
+                    out.push((entry.path().to_string_lossy().into_owned(), meta.ino()));
+                }
+            }
+        }
+    }
+
+    let mut found = Vec::new();
+
+    if let Ok(users) = std::fs::read_dir("/run/user") {
+        for user in users.filter_map(Result::ok) {
+            sockets(
+                &user.path(),
+                |name| {
+                    name.strip_prefix("wayland-")
+                        .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+                },
+                &mut found,
+            );
+        }
+    }
+
+    sockets(Path::new("/tmp/.X11-unix"), |name| name.starts_with('X'), &mut found);
+
+    if found.is_empty() {
+        return None;
+    }
+
+    found.sort_unstable();
+    let mut hasher = DefaultHasher::new();
+    found.hash(&mut hasher);
+    Some(hasher.finish())
+}
+
 /// Log how a display change ended, and pass the result through.
 fn log_outcome(change: &str, result: Result<(), DisplayError>) -> Result<(), DisplayError> {
     match &result {

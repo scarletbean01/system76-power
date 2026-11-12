@@ -12,7 +12,7 @@ use std::{
         Arc,
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tokio::{
     signal::unix::{signal, SignalKind},
@@ -23,18 +23,16 @@ use zbus::Interface;
 
 use crate::{
     charge_thresholds::{get_charge_profiles, get_charge_thresholds, set_charge_thresholds},
-    errors::ProfileError,
     fan::FanDaemon,
     graphics::{update_initramfs_cmd, Graphics, GraphicsMode, SwitchStage},
     hid_backlight,
     hotplug::{mux, Detect, HotPlugDetect},
     kernel_parameters::{KernelParameter, NmiWatchdog},
     runtime_pm::{runtime_pm_quirks, thunderbolt_hotplug_wakeup},
-    DBUS_NAME, DBUS_PATH,
+    Profile, DBUS_NAME, DBUS_PATH,
 };
 
-mod profiles;
-use self::profiles::{balanced, battery, performance};
+pub mod profiles;
 
 use system76_power_zbus::ChargeProfile;
 
@@ -155,12 +153,27 @@ impl Drop for FlagGuard {
     fn drop(&mut self) { self.0.store(false, Ordering::SeqCst); }
 }
 
+/// Retries of a refresh-rate change that failed because the graphical
+/// session was not ready (e.g. at boot, before login or while the compositor
+/// starts). Delays double from [`REFRESH_RETRY_BASE`] up to [`REFRESH_RETRY_MAX`].
+const REFRESH_RETRY_ATTEMPTS: u32 = 6;
+const REFRESH_RETRY_BASE: Duration = Duration::from_secs(2);
+const REFRESH_RETRY_MAX: Duration = Duration::from_secs(30);
+
+/// A refresh-rate change waiting for the graphical session.
+#[derive(Clone, Copy, Debug)]
+struct PendingRefresh {
+    hz:       u32,
+    attempts: u32,
+    next_try: Instant,
+}
+
 struct PowerDaemon {
     initial_set:                 bool,
     graphics:                    Arc<std::sync::Mutex<Graphics>>,
     switch_in_progress:          Arc<AtomicBool>,
-    power_profile:               String,
-    profile_errors:              Vec<ProfileError>,
+    /// The last applied profile; `None` until the initial profile is set.
+    power_profile:               Option<Profile>,
     held_profiles:               Vec<(u32, &'static str, String, String)>,
     profile_ids:                 u32,
     connections:                 Option<(zbus::Connection, zbus::Connection, zbus::Connection)>,
@@ -169,6 +182,11 @@ struct PowerDaemon {
     /// Cleared only when the charger is unplugged (PowerSource::Battery event).
     /// While set, profile switches will not override the display refresh rate.
     ac_display_locked:           bool,
+    /// Refresh-rate change to retry once the graphical session is ready.
+    pending_refresh:             Option<PendingRefresh>,
+    /// Last [`crate::display::session_fingerprint`]; a change means a
+    /// compositor (re)started and the profile's refresh rate is re-applied.
+    display_session:             Option<u64>,
 }
 
 impl PowerDaemon {
@@ -181,49 +199,160 @@ impl PowerDaemon {
             initial_set:                 false,
             graphics,
             switch_in_progress,
-            power_profile:               String::new(),
-            profile_errors:              Vec::new(),
+            power_profile:               None,
             held_profiles:               Vec::new(),
             profile_ids:                 0,
             connections:                 None,
             auto_switch_manual_override: false,
             ac_display_locked:           false,
+            pending_refresh:             None,
+            display_session:             crate::display::session_fingerprint(),
         })
     }
 
+    /// Arms the auto-switch override when a user switches profiles by hand
+    /// (not during startup, and not when re-selecting the active profile).
+    fn note_manual_switch(&mut self, profile: Profile) {
+        if crate::config::current().auto_switch
+            && self.initial_set
+            && self.power_profile != Some(profile)
+        {
+            log::info!("manual profile change to {} detected, setting override flag", profile.name());
+            self.auto_switch_manual_override = true;
+        }
+    }
+
+    /// The active profile's refresh rate, if one should be applied now.
+    fn profile_refresh_hz(&self) -> Option<u32> {
+        let refresh = crate::config::current().refresh_rate;
+        let profile = self.power_profile?;
+
+        if !refresh.enabled || self.ac_display_locked {
+            return None;
+        }
+
+        let hz = match profile {
+            Profile::Battery => refresh.battery,
+            Profile::Balanced => refresh.balanced,
+            Profile::Performance => refresh.performance,
+        };
+
+        (hz > 0).then_some(hz)
+    }
+
+    /// Sets the display refresh rate (off the async runtime). A failure that
+    /// may be transient schedules a retry with exponential backoff.
+    async fn set_refresh_rate(&mut self, hz: u32, attempts: u32) {
+        let result =
+            tokio::task::spawn_blocking(move || crate::display::set_refresh_rate(hz)).await;
+
+        self.pending_refresh = match result {
+            Ok(Ok(())) => None,
+            Ok(Err(why))
+                if crate::display::is_retryable(&why) && attempts < REFRESH_RETRY_ATTEMPTS =>
+            {
+                let delay = REFRESH_RETRY_BASE
+                    .saturating_mul(1 << attempts.min(16))
+                    .min(REFRESH_RETRY_MAX);
+                log::warn!(
+                    "Failed to set display refresh rate to {}Hz: {}; retrying in {:?}{}",
+                    hz,
+                    why,
+                    delay,
+                    if self.display_session.is_none() { " after a session starts" } else { "" }
+                );
+                Some(PendingRefresh { hz, attempts: attempts + 1, next_try: Instant::now() + delay })
+            }
+            Ok(Err(why)) => {
+                log::warn!("Failed to set display refresh rate to {}Hz: {}; giving up", hz, why);
+                None
+            }
+            Err(why) => {
+                log::error!("Setting the display refresh rate panicked: {}", why);
+                None
+            }
+        };
+    }
+
+    /// Called once per main-loop tick: re-applies the profile's refresh rate
+    /// when a graphical session (re)starts, and runs due retries.
+    async fn poll_display(&mut self) {
+        let session = crate::display::session_fingerprint();
+
+        if session != self.display_session {
+            self.display_session = session;
+
+            // Compositors start at their own default mode (often the panel's
+            // maximum rate), so a new session needs the profile's rate again.
+            if session.is_some() && self.initial_set {
+                if let Some(hz) = self.profile_refresh_hz() {
+                    log::info!("Graphical session started; applying {}Hz refresh rate", hz);
+                    // Give the compositor a moment to bring up its outputs.
+                    self.pending_refresh = Some(PendingRefresh {
+                        hz,
+                        attempts: 0,
+                        next_try: Instant::now() + REFRESH_RETRY_BASE,
+                    });
+                }
+            }
+        }
+
+        // Without a session every attempt would fail; wait for one.
+        if self.display_session.is_none() {
+            return;
+        }
+
+        if let Some(pending) = self.pending_refresh {
+            if Instant::now() >= pending.next_try {
+                self.set_refresh_rate(pending.hz, pending.attempts).await;
+            }
+        }
+    }
+
+    /// Applies `profile` unless it is already active (or `force` is set).
+    ///
+    /// The active profile is updated even when some parameters fail to apply;
+    /// those failures are returned as one error message.
     async fn apply_profile(
         &mut self,
         context: &zbus::SignalContext<'_>,
-        func: fn(&mut Vec<ProfileError>, bool),
-        name: &str,
+        profile: Profile,
         force: bool,
     ) -> Result<(), String> {
-        if !force && self.power_profile == name {
+        if !force && self.power_profile == Some(profile) {
             log::info!("profile was already set");
             return Ok(());
         }
 
+        let name = profile.name();
         let _res = System76Power::power_profile_switch(context, name).await;
 
         let config = crate::config::current();
         // Backlight/keyboard dimming is opt-in and only applies to the Battery
         // profile.  Other profiles never touch the user's brightness.
-        let set_brightness = config.profile.dim_on_battery && name == "Battery";
-        func(&mut self.profile_errors, set_brightness);
+        let set_brightness = config.profile.dim_on_battery && profile == Profile::Battery;
 
-        self.power_profile = name.into();
+        // Applying a profile is many blocking sysfs writes plus helper
+        // processes (ryzenadj, iw, …); keep it off the single-threaded runtime
+        // so D-Bus requests are still served meanwhile. The daemon lock stays
+        // held, so profile switches remain serialized.
+        let refresh = config.refresh_rate.clone();
+        let errors = tokio::task::spawn_blocking(move || {
+            profiles::apply(profile, &config, set_brightness)
+        })
+        .await
+        .map_err(|why| format!("applying the {} profile panicked: {}", name, why))?;
 
-        // Apply refresh rate if enabled
-        let refresh = &config.refresh_rate;
+        self.power_profile = Some(profile);
+
+        // Apply refresh rate if enabled. A newer profile supersedes any retry
+        // still pending from the previous one.
+        self.pending_refresh = None;
         if refresh.enabled {
-            let hz = match name {
-                "Battery" => refresh.battery,
-                "Balanced" => refresh.balanced,
-                "Performance" => refresh.performance,
-                _ => {
-                    log::warn!("Unknown profile '{}', skipping refresh rate change", name);
-                    0 // Will be skipped
-                }
+            let hz = match profile {
+                Profile::Battery => refresh.battery,
+                Profile::Balanced => refresh.balanced,
+                Profile::Performance => refresh.performance,
             };
 
             if hz > 0 {
@@ -234,23 +363,22 @@ impl PowerDaemon {
                     );
                 } else {
                     log::info!("Setting display refresh rate to {}Hz for {} profile", hz, name);
-                    if let Err(e) = crate::display::set_refresh_rate(hz) {
-                        log::warn!("Failed to set display refresh rate to {}Hz: {}", hz, e);
-                    }
+                    self.set_refresh_rate(hz, 0).await;
                 }
             }
         }
 
-        if self.profile_errors.is_empty() {
-            Ok(())
-        } else {
-            let mut error_message = String::from("Errors found when setting profile:");
-            for error in self.profile_errors.drain(..) {
-                error_message = format!("{}\n    - {}", error_message, error);
-            }
-
-            Err(error_message)
+        if errors.is_empty() {
+            return Ok(());
         }
+
+        let mut message = String::from("Errors found when setting profile:");
+        for error in errors {
+            message.push_str("\n    - ");
+            message.push_str(&error.to_string());
+        }
+
+        Err(message)
     }
 }
 
@@ -267,6 +395,25 @@ struct System76Power {
 }
 
 impl System76Power {
+    /// A user-requested profile switch: arms the auto-switch override and
+    /// applies the profile under one lock, then announces the new profile.
+    async fn switch_profile(
+        &self,
+        context: &zbus::SignalContext<'_>,
+        profile: Profile,
+    ) -> zbus::fdo::Result<()> {
+        let result = {
+            let mut daemon = self.daemon.lock().await;
+            daemon.note_manual_switch(profile);
+            daemon.apply_profile(context, profile, false).await
+        };
+
+        // The profile is active even if some parameters failed to apply, so
+        // clients are always told about it.
+        self.emit_active_profile_changed().await;
+        result.map_err(zbus_error_from_display)
+    }
+
     fn lock_graphics(&self) -> zbus::fdo::Result<std::sync::MutexGuard<'_, Graphics>> {
         if self.switch_in_progress.load(Ordering::SeqCst) {
             return Err(zbus::fdo::Error::Failed("Graphics switch in progress".into()));
@@ -288,7 +435,7 @@ impl System76Power {
             let this = self.daemon.lock().await;
             let Some((_, upp, hadess)) = this.connections.clone() else { return };
 
-            let profile = system76_profile_to_upp_str(&this.power_profile);
+            let profile = this.power_profile.map_or("unknown", Profile::upp_name);
             (upp, hadess, profile)
         };
 
@@ -326,98 +473,26 @@ impl System76Power {
         &mut self,
         #[zbus(signal_context)] context: zbus::SignalContext<'_>,
     ) -> zbus::fdo::Result<()> {
-        // Detect manual profile change - set override flag (but not during initial startup)
-        {
-            let mut daemon = self.daemon.lock().await;
-            if crate::config::current().auto_switch
-                && daemon.initial_set 
-                && daemon.power_profile != "Battery" 
-            {
-                log::info!("Manual profile change to Battery detected, setting override flag");
-                daemon.auto_switch_manual_override = true;
-            }
-        }
-        
-        let result = self
-            .daemon
-            .lock()
-            .await
-            .apply_profile(&context, battery, "Battery", false)
-            .await
-            .map_err(zbus_error_from_display);
-
-        if result.is_ok() {
-            self.emit_active_profile_changed().await
-        }
-
-        result
+        self.switch_profile(&context, Profile::Battery).await
     }
 
     async fn balanced(
         &mut self,
         #[zbus(signal_context)] context: zbus::SignalContext<'_>,
     ) -> zbus::fdo::Result<()> {
-        // Detect manual profile change - set override flag (but not during initial startup)
-        {
-            let mut daemon = self.daemon.lock().await;
-            if crate::config::current().auto_switch
-                && daemon.initial_set 
-                && daemon.power_profile != "Balanced" 
-            {
-                log::info!("Manual profile change to Balanced detected, setting override flag");
-                daemon.auto_switch_manual_override = true;
-            }
-        }
-        
-        let result = self
-            .daemon
-            .lock()
-            .await
-            .apply_profile(&context, balanced, "Balanced", false)
-            .await
-            .map_err(zbus_error_from_display);
-
-        if result.is_ok() {
-            self.emit_active_profile_changed().await
-        }
-
-        result
+        self.switch_profile(&context, Profile::Balanced).await
     }
 
     async fn performance(
         &mut self,
         #[zbus(signal_context)] context: zbus::SignalContext<'_>,
     ) -> zbus::fdo::Result<()> {
-        // Detect manual profile change - set override flag (but not during initial startup)
-        {
-            let mut daemon = self.daemon.lock().await;
-            if crate::config::current().auto_switch
-                && daemon.initial_set 
-                && daemon.power_profile != "Performance" 
-            {
-                log::info!("Manual profile change to Performance detected, setting override flag");
-                daemon.auto_switch_manual_override = true;
-            }
-        }
-        
-        let result = self
-            .daemon
-            .lock()
-            .await
-            .apply_profile(&context, performance, "Performance", false)
-            .await
-            .map_err(zbus_error_from_display);
-
-        if result.is_ok() {
-            self.emit_active_profile_changed().await
-        }
-
-        result
+        self.switch_profile(&context, Profile::Performance).await
     }
 
     #[dbus_interface(out_args("profile"))]
     async fn get_profile(&self) -> zbus::fdo::Result<String> {
-        Ok(self.daemon.lock().await.power_profile.clone())
+        Ok(self.daemon.lock().await.power_profile.map_or("", Profile::name).to_owned())
     }
 
     #[dbus_interface(out_args("required"))]
@@ -899,37 +974,29 @@ impl UPowerPowerProfiles {
 
     #[dbus_interface(property)]
     async fn active_profile(&self) -> &str {
-        system76_profile_to_upp_str(self.0.lock().await.power_profile.as_str())
+        self.0.lock().await.power_profile.map_or("unknown", Profile::upp_name)
     }
 
     #[dbus_interface(property)]
     async fn set_active_profile(&mut self, profile: &str) {
-        let (func, profile): (fn(&mut Vec<ProfileError>, bool), &'static str) = match profile {
-            "power-saver" => (battery, "Battery"),
-            "balanced" => (balanced, "Balanced"),
-            "performance" => (performance, "Performance"),
-            _ => return,
+        let Some(profile) = Profile::from_upp_name(profile) else {
+            return;
         };
 
         let mut this = self.0.lock().await;
 
         // A manual profile change arms the override so the next automatic
         // switch is suppressed (only after startup finished).
-        if crate::config::current().auto_switch
-            && this.initial_set
-            && this.power_profile != profile
-        {
-            log::info!("manual profile change to {} detected, setting override flag", profile);
-            this.auto_switch_manual_override = true;
-        }
+        this.note_manual_switch(profile);
 
         let Some((ref connection, ..)) = this.connections else {
             return;
         };
 
         if let Ok(context) = zbus::SignalContext::new(connection, DBUS_PATH) {
-            let _res =
-                this.apply_profile(&context, func, profile, false).await.map_err(zbus_error_from_display);
+            if let Err(why) = this.apply_profile(&context, profile, false).await {
+                log::warn!("{}", why);
+            }
         }
     }
 
@@ -1189,36 +1256,39 @@ pub async fn daemon() -> anyhow::Result<()> {
                 continue;
             }
 
-            let (target_profile, profile_func) = match source {
+            let target_profile = match source {
                 crate::power_supply::PowerSource::AC => {
                     log::info!("AC adapter connected, auto-switching to Balanced profile");
-                    ("Balanced", balanced as fn(&mut Vec<ProfileError>, bool))
+                    Profile::Balanced
                 }
                 crate::power_supply::PowerSource::Battery => {
                     log::info!("On battery power, auto-switching to Battery profile");
                     daemon.ac_display_locked = false;
                     log::info!("AC display lock cleared — charger unplugged");
-                    ("Battery", battery as fn(&mut Vec<ProfileError>, bool))
+                    Profile::Battery
                 }
             };
 
-            match daemon.apply_profile(&context_clone, profile_func, target_profile, false).await {
-                Ok(()) => {
-                    // Set the lock after a successful AC profile apply.
-                    if target_profile == "Balanced" {
-                        daemon.ac_display_locked = true;
-                        log::info!("AC display lock set — refresh rate will not change until charger is unplugged");
-                    }
-                    log::info!("Auto-switch to {} profile successful", target_profile);
-                    // Drop the lock before emitting signals
-                    drop(daemon);
-                    // Emit D-Bus signals to notify clients of the profile change
-                    system76_clone.emit_active_profile_changed().await;
-                }
+            let result = daemon.apply_profile(&context_clone, target_profile, false).await;
+
+            // Set the lock once the AC profile is active. Errors from single
+            // parameters (e.g. ryzenadj) do not undo the switch itself.
+            if target_profile == Profile::Balanced {
+                daemon.ac_display_locked = true;
+                log::info!("AC display lock set — refresh rate will not change until charger is unplugged");
+            }
+
+            match result {
+                Ok(()) => log::info!("Auto-switch to {} profile successful", target_profile.name()),
                 Err(e) => {
-                    log::error!("Auto-switch to {} profile failed: {}", target_profile, e);
+                    log::error!("Auto-switch to {} profile had errors: {}", target_profile.name(), e);
                 }
             }
+
+            // The profile is active even if some parameters failed, so always
+            // notify clients. Drop the lock before emitting signals.
+            drop(daemon);
+            system76_clone.emit_active_profile_changed().await;
         }
         
         log::warn!("Power monitoring channel closed, auto-switching stopped");
@@ -1247,28 +1317,22 @@ pub async fn daemon() -> anyhow::Result<()> {
             // so the new settings take effect immediately.
             if RELOAD.swap(false, Ordering::SeqCst) {
                 let mut daemon = system76_daemon.daemon.lock().await;
-                let name = if daemon.power_profile.is_empty() {
-                    "Balanced".to_string()
-                } else {
-                    daemon.power_profile.clone()
-                };
+                let profile = daemon.power_profile.unwrap_or(Profile::Balanced);
 
-                let func = match name.as_str() {
-                    "Battery" => battery as fn(&mut Vec<ProfileError>, bool),
-                    "Performance" => performance as fn(&mut Vec<ProfileError>, bool),
-                    _ => balanced as fn(&mut Vec<ProfileError>, bool),
-                };
-
-                match daemon.apply_profile(&context, func, &name, true).await {
-                    Ok(()) => log::info!("re-applied {} profile after config reload", name),
-                    Err(e) => {
-                        log::warn!("failed to re-apply {} profile after config reload: {}", name, e)
-                    }
+                match daemon.apply_profile(&context, profile, true).await {
+                    Ok(()) => log::info!("re-applied {} profile after config reload", profile.name()),
+                    Err(e) => log::warn!(
+                        "failed to re-apply {} profile after config reload: {}",
+                        profile.name(),
+                        e
+                    ),
                 }
 
                 drop(daemon);
                 system76_daemon.emit_active_profile_changed().await;
             }
+
+            system76_daemon.daemon.lock().await.poll_display().await;
 
             fan_daemon.step();
 
@@ -1304,15 +1368,6 @@ pub async fn daemon() -> anyhow::Result<()> {
 
     log::info!("daemon exited from loop");
     Ok(())
-}
-
-fn system76_profile_to_upp_str(system76_profile: &str) -> &'static str {
-    match system76_profile {
-        "Battery" => "power-saver",
-        "Balanced" => "balanced",
-        "Performance" => "performance",
-        _ => "unknown",
-    }
 }
 
 fn zbus_error_from_display<E: Display>(why: E) -> zbus::fdo::Error {

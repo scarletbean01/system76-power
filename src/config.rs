@@ -15,6 +15,7 @@
 //! and ignored, and a malformed value falls back to that key's default without
 //! aborting the daemon.
 
+use crate::Profile;
 use std::{
     fs,
     sync::{LazyLock, RwLock},
@@ -72,11 +73,18 @@ pub struct ProfileConfig {
     /// When `true`, entering the Battery profile dims the backlight even after
     /// the initial boot-time set.
     pub dim_on_battery: bool,
+    /// amdgpu `panel_power_savings` level (0 = off … 4 = max) on Battery.
+    /// Trades some colour accuracy for lower backlight power (ABM). Other
+    /// profiles always use 0.
+    pub battery_panel_power_savings: u8,
 }
+
+/// Highest amdgpu `panel_power_savings` level.
+pub const PANEL_POWER_SAVINGS_MAX: u8 = 4;
 
 impl Default for ProfileConfig {
     fn default() -> Self {
-        Self { dim_on_battery: false }
+        Self { dim_on_battery: false, battery_panel_power_savings: 3 }
     }
 }
 
@@ -94,7 +102,13 @@ impl Default for UsbConfig {
     fn default() -> Self {
         Self {
             autosuspend:       true,
-            blacklist_drivers: vec!["usblp".to_string()],
+            // Printers, Bluetooth radios and HID input devices misbehave when
+            // autosuspended (lost jobs, reconnect delays, input lag).
+            blacklist_drivers: vec![
+                "usblp".to_string(),
+                "btusb".to_string(),
+                "usbhid".to_string(),
+            ],
             blacklist:         Vec::new(),
         }
     }
@@ -169,8 +183,49 @@ pub struct CpuConfig {
     pub ac_fast_mw:       u32,
     pub ac_slow_mw:       u32,
     pub ac_tctl_c:        u32,
+    /// Performance-profile overrides; each falls back to its `ac_*` value.
+    pub performance_stapm_mw: Option<u32>,
+    pub performance_fast_mw:  Option<u32>,
+    pub performance_slow_mw:  Option<u32>,
+    pub performance_tctl_c:   Option<u32>,
     /// EPP preference for the Battery profile on `amd-pstate-epp`.
     pub battery_epp:      String,
+}
+
+/// AMD SMU limits handed to `ryzenadj` (milliwatts; Tctl in °C).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RyzenLimits {
+    pub stapm_mw: u32,
+    pub fast_mw:  u32,
+    pub slow_mw:  u32,
+    pub tctl_c:   u32,
+}
+
+impl CpuConfig {
+    /// The SMU limits configured for `profile`.
+    #[must_use]
+    pub fn ryzen_limits(&self, profile: Profile) -> RyzenLimits {
+        match profile {
+            Profile::Battery => RyzenLimits {
+                stapm_mw: self.battery_stapm_mw,
+                fast_mw:  self.battery_fast_mw,
+                slow_mw:  self.battery_slow_mw,
+                tctl_c:   self.battery_tctl_c,
+            },
+            Profile::Balanced => RyzenLimits {
+                stapm_mw: self.ac_stapm_mw,
+                fast_mw:  self.ac_fast_mw,
+                slow_mw:  self.ac_slow_mw,
+                tctl_c:   self.ac_tctl_c,
+            },
+            Profile::Performance => RyzenLimits {
+                stapm_mw: self.performance_stapm_mw.unwrap_or(self.ac_stapm_mw),
+                fast_mw:  self.performance_fast_mw.unwrap_or(self.ac_fast_mw),
+                slow_mw:  self.performance_slow_mw.unwrap_or(self.ac_slow_mw),
+                tctl_c:   self.performance_tctl_c.unwrap_or(self.ac_tctl_c),
+            },
+        }
+    }
 }
 
 impl Default for CpuConfig {
@@ -184,6 +239,10 @@ impl Default for CpuConfig {
             ac_fast_mw:       80_000,
             ac_slow_mw:       80_000,
             ac_tctl_c:        95,
+            performance_stapm_mw: None,
+            performance_fast_mw:  None,
+            performance_slow_mw:  None,
+            performance_tctl_c:   None,
             battery_epp:      "power".to_string(),
         }
     }
@@ -395,6 +454,12 @@ fn apply(config: &mut Config, section: &str, key: &str, value: &str) -> bool {
             "dim_on_battery" => {
                 set_bool(&mut config.profile.dim_on_battery, value, section, key);
             }
+            "battery_panel_power_savings" => match parse_u32(value) {
+                Some(level) if level <= u32::from(PANEL_POWER_SAVINGS_MAX) => {
+                    config.profile.battery_panel_power_savings = level as u8;
+                }
+                _ => warn_invalid(section, key, value),
+            },
             _ => return false,
         },
         "usb" => match key {
@@ -433,6 +498,18 @@ fn apply(config: &mut Config, section: &str, key: &str, value: &str) -> bool {
             "ac_fast_mw" => set_u32(&mut config.cpu.ac_fast_mw, value, section, key),
             "ac_slow_mw" => set_u32(&mut config.cpu.ac_slow_mw, value, section, key),
             "ac_tctl_c" => set_u32(&mut config.cpu.ac_tctl_c, value, section, key),
+            "performance_stapm_mw" => {
+                set_opt_u32(&mut config.cpu.performance_stapm_mw, value, section, key);
+            }
+            "performance_fast_mw" => {
+                set_opt_u32(&mut config.cpu.performance_fast_mw, value, section, key);
+            }
+            "performance_slow_mw" => {
+                set_opt_u32(&mut config.cpu.performance_slow_mw, value, section, key);
+            }
+            "performance_tctl_c" => {
+                set_opt_u32(&mut config.cpu.performance_tctl_c, value, section, key);
+            }
             "battery_epp" => config.cpu.battery_epp = value.to_string(),
             _ => return false,
         },
@@ -538,6 +615,13 @@ fn set_bool(target: &mut bool, value: &str, section: &str, key: &str) {
 fn set_u32(target: &mut u32, value: &str, section: &str, key: &str) {
     match parse_u32(value) {
         Some(v) => *target = v,
+        None => warn_invalid(section, key, value),
+    }
+}
+
+fn set_opt_u32(target: &mut Option<u32>, value: &str, section: &str, key: &str) {
+    match parse_u32(value) {
+        Some(v) => *target = Some(v),
         None => warn_invalid(section, key, value),
     }
 }
@@ -657,6 +741,51 @@ mod tests {
         // A real trailing comment is still stripped.
         let config = parse("[refresh_rate]\nperformance = 240 # max\n");
         assert_eq!(config.refresh_rate.performance, 240);
+    }
+
+    #[test]
+    fn panel_power_savings_parsed_and_bounded() {
+        assert_eq!(Config::default().profile.battery_panel_power_savings, 3);
+
+        let config = parse("[profile]\nbattery_panel_power_savings = 0\n");
+        assert_eq!(config.profile.battery_panel_power_savings, 0);
+
+        // Out of range keeps the default.
+        let config = parse("[profile]\nbattery_panel_power_savings = 9\n");
+        assert_eq!(config.profile.battery_panel_power_savings, 3);
+    }
+
+    #[test]
+    fn performance_limits_fall_back_to_ac() {
+        let config = parse("[cpu]\nac_stapm_mw = 50000\nac_tctl_c = 90\n");
+        let limits = config.cpu.ryzen_limits(Profile::Performance);
+        assert_eq!(limits, config.cpu.ryzen_limits(Profile::Balanced));
+        assert_eq!(limits.stapm_mw, 50000);
+        assert_eq!(limits.tctl_c, 90);
+    }
+
+    #[test]
+    fn performance_limits_parsed() {
+        let config = parse(
+            "[cpu]\nperformance_stapm_mw = 65000\nperformance_fast_mw = 90000\n\
+             performance_slow_mw = 85000\nperformance_tctl_c = 98\nperformance_tctl_c = nope\n",
+        );
+        let limits = config.cpu.ryzen_limits(Profile::Performance);
+        assert_eq!(
+            limits,
+            RyzenLimits { stapm_mw: 65000, fast_mw: 90000, slow_mw: 85000, tctl_c: 98 }
+        );
+        // Balanced keeps the AC envelope.
+        assert_eq!(config.cpu.ryzen_limits(Profile::Balanced).stapm_mw, 55_000);
+    }
+
+    #[test]
+    fn battery_limits_use_battery_keys() {
+        let config = parse("[cpu]\nbattery_stapm_mw = 15000\nbattery_tctl_c = 70\n");
+        let limits = config.cpu.ryzen_limits(Profile::Battery);
+        assert_eq!(limits.stapm_mw, 15000);
+        assert_eq!(limits.fast_mw, 18_000);
+        assert_eq!(limits.tctl_c, 70);
     }
 
     #[test]
