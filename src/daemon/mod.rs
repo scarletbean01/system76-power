@@ -1164,16 +1164,22 @@ pub async fn daemon() -> anyhow::Result<()> {
     // Create channel for AC power monitoring
     let (power_tx, mut power_rx) = tokio::sync::mpsc::unbounded_channel();
     
-    // Spawn async AC power monitoring task - uses Netlink uevents for instant hardware-driven detection.
-    // Retries with exponential backoff on fatal socket errors so auto-switching survives transient
-    // kernel-level failures without requiring a daemon restart.
+    // Spawn async AC power monitoring task, driven by kernel uevents on a Netlink socket.
+    // Retries with exponential backoff on socket errors so auto-switching survives transient
+    // kernel-level failures without requiring a daemon restart. `last_sent` outlives each
+    // attempt, so a restart does not repeat a power source the handler already acted on.
     tokio::spawn(async move {
         let mut delay = Duration::from_secs(1);
+        let mut last_sent = None;
         loop {
-            match crate::power_supply::monitor_channel(power_tx.clone()).await {
+            match crate::power_supply::monitor_channel(&power_tx, &mut last_sent).await {
                 Ok(()) => {
                     // Channel closed cleanly (receiver dropped) — no point retrying.
                     log::info!("AC power monitoring stopped (channel closed)");
+                    break;
+                }
+                Err(e @ crate::power_supply::MonitorError::Unavailable) => {
+                    log::info!("AC power monitoring disabled: {}", e);
                     break;
                 }
                 Err(e) => {
